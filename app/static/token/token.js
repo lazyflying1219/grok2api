@@ -411,6 +411,7 @@ function stopAutoRegisterPolling() {
   }
   autoRegisterJobId = null;
   autoRegisterLastAdded = 0;
+  updateAutoRegisterLogs([]);
 
   const stopBtn = document.getElementById('auto-register-stop-btn');
   if (stopBtn) {
@@ -424,6 +425,20 @@ function updateAutoRegisterStatus(text) {
   if (!statusEl) return;
   statusEl.textContent = text;
   statusEl.classList.remove('hidden');
+}
+
+function updateAutoRegisterLogs(lines) {
+  const el = document.getElementById('auto-register-logs');
+  if (!el) return;
+  const arr = Array.isArray(lines) ? lines : [];
+  const text = arr.filter(x => typeof x === 'string').join('\n');
+  if (!text) {
+    el.textContent = '';
+    el.classList.add('hidden');
+    return;
+  }
+  el.textContent = text;
+  el.classList.remove('hidden');
 }
 
 async function startAutoRegister() {
@@ -461,6 +476,7 @@ async function startAutoRegister() {
     autoRegisterJobId = data.job?.job_id || null;
     autoRegisterLastAdded = 0;
     updateAutoRegisterStatus('正在启动注册...');
+    updateAutoRegisterLogs(data.job?.logs || []);
 
     const stopBtn = document.getElementById('auto-register-stop-btn');
     if (stopBtn) {
@@ -527,6 +543,7 @@ async function pollAutoRegisterStatus() {
     }
 
     const data = await res.json();
+    updateAutoRegisterLogs(data.logs || []);
     const status = data.status;
     if (status === 'idle' || status === 'not_found') {
       updateAutoRegisterStatus('注册任务已结束');

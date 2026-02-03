@@ -543,6 +543,71 @@ adminRoutes.post("/api/v1/admin/tokens/refresh", requireAdminAuth, async (c) => 
   }
 });
 
+adminRoutes.get("/api/v1/admin/register/diagnose", requireAdminAuth, async (c) => {
+  try {
+    const settings = await getSettings(c.env);
+    const cf = String(settings.grok.cf_clearance ?? "").trim();
+
+    const userAgent =
+      c.req.header("user-agent") ||
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+    const deep = String(c.req.query("deep") ?? "").trim() === "1";
+    const headers: Record<string, string> = {
+      "user-agent": userAgent,
+      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    };
+    if (cf) headers.cookie = `cf_clearance=${cf}`;
+
+    const res = await fetch("https://accounts.x.ai/sign-up", { headers, redirect: "manual" });
+    const html = await res.text();
+    const title = html.match(/<title>([^<]+)<\/title>/i)?.[1]?.trim() ?? "";
+    const hasCloudflare = /cloudflare|attention required|just a moment/i.test(`${title}\n${html}`);
+
+    const stateTree = html.match(/next-router-state-tree\":\"([^\"]+)\"/)?.[1] ?? "";
+    const siteKey = html.match(/sitekey\":\"(0x4[a-zA-Z0-9_-]+)\"/)?.[1] ?? "";
+
+    const scripts = Array.from(html.matchAll(/<script[^>]+src=\"([^\"]+)\"[^>]*>/g))
+      .map((m) => m[1]!)
+      .filter((src) => src.includes("_next/static"))
+      .slice(0, 20);
+
+    let actionId = "";
+    if (deep && res.ok && scripts.length) {
+      for (const src of scripts.slice(0, 8)) {
+        const url = new URL(src, "https://accounts.x.ai/sign-up").toString();
+        const jsRes = await fetch(url, { headers: { "user-agent": userAgent, ...(cf ? { cookie: `cf_clearance=${cf}` } : {}) } });
+        if (!jsRes.ok) continue;
+        const js = await jsRes.text();
+        const m = js.match(/7f[a-fA-F0-9]{40}/);
+        if (m?.[0]) {
+          actionId = m[0];
+          break;
+        }
+      }
+    }
+
+    return c.json({
+      ok: res.ok,
+      status: res.status,
+      title,
+      cf_ray: res.headers.get("cf-ray") ?? "",
+      server: res.headers.get("server") ?? "",
+      has_cloudflare: hasCloudflare,
+      has_state_tree: Boolean(stateTree),
+      has_site_key: Boolean(siteKey),
+      scripts: scripts.length,
+      action_id_found: Boolean(actionId),
+      action_id_prefix: actionId ? `${actionId.slice(0, 8)}…` : "",
+      cf_clearance_configured: Boolean(cf),
+      note:
+        "If status is 403/503 with Cloudflare page, Workers auto-register will likely fail. Use local/docker register or provide a valid cf_clearance (best-effort).",
+    });
+  } catch (e) {
+    return c.json(legacyErr(`Diagnose failed: ${e instanceof Error ? e.message : String(e)}`), 500);
+  }
+});
+
 adminRoutes.post("/api/v1/admin/tokens/auto-register", requireAdminAuth, async (c) => {
   try {
     const ns = (c.env as any).AUTO_REGISTER as DurableObjectNamespace | undefined;

@@ -211,9 +211,11 @@
             </div>
           </div>
           <div class="text-xs text-[var(--accents-5)]">
-            自动注册会先启动本地 Turnstile Solver（默认 5 线程），完成后自动关闭。
+            本地/Docker：可自动启动本地 Turnstile Solver（默认 5 线程）。Cloudflare：需配置 YesCaptcha 或公网 Solver，且 accounts.x.ai 可能触发 Cloudflare Challenge 导致失败。
           </div>
           <div id="auto-register-status" class="text-xs text-[var(--accents-5)] hidden"></div>
+          <pre id="auto-register-logs"
+            class="hidden text-xs font-mono whitespace-pre-wrap bg-[var(--accents-1)] border border-[var(--border)] rounded-md p-2 max-h-40 overflow-auto"></pre>
           <div class="flex justify-end gap-2 pt-2">
             <button onclick="closeAddModal()" class="geist-button-outline text-xs px-3">取消</button>
             <button id="auto-register-stop-btn" onclick="stopAutoRegister()" class="geist-button-danger text-xs px-3 hidden">停止</button>

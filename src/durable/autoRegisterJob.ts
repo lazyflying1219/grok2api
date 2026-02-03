@@ -18,6 +18,7 @@ interface JobState {
   errors: number;
   error: string | null;
   last_error: string | null;
+  logs: string[];
   started_at: number;
   finished_at: number | null;
   stop_requested: boolean;
@@ -40,6 +41,13 @@ function shortError(msg: unknown): string {
   return s.length > 500 ? `${s.slice(0, 500)}...` : s;
 }
 
+function pushLog(job: JobState, message: string): void {
+  const ts = new Date().toISOString();
+  const line = `${ts} ${String(message || "").trim()}`.trim();
+  const next = [...(job.logs || []), line];
+  job.logs = next.slice(-200);
+}
+
 function jobToDict(job: JobState): Record<string, unknown> {
   return {
     job_id: job.job_id,
@@ -52,6 +60,7 @@ function jobToDict(job: JobState): Record<string, unknown> {
     errors: job.errors,
     error: job.error,
     last_error: job.last_error,
+    logs: (job.logs || []).slice(-80),
     started_at: job.started_at,
     finished_at: job.finished_at,
   };
@@ -79,8 +88,10 @@ export class AutoRegisterJob implements DurableObject {
     const now = nowMs();
     const cur = job.action;
     if (cur && now - cur.updated_at < 10 * 60 * 1000) return cur;
-    const fresh = await getActionConfigCached(cur as any, 0);
+    pushLog(job, "Fetching sign-up action config...");
+    const fresh = await getActionConfigCached(cur as any, 0, { cf_clearance: job.grok.cf_clearance });
     job.action = { ...fresh, updated_at: now };
+    pushLog(job, `Action config ready (action_id=${fresh.action_id.slice(0, 8)}…)`);
     await this.saveJob(job);
     return job.action;
   }
@@ -122,6 +133,7 @@ export class AutoRegisterJob implements DurableObject {
           errors: 0,
           error: "Missing required register config: register.worker_domain / register.email_domain / register.admin_password",
           last_error: null,
+          logs: [],
           started_at: nowMs(),
           finished_at: nowMs(),
           stop_requested: false,
@@ -131,6 +143,7 @@ export class AutoRegisterJob implements DurableObject {
           grok,
           action: null,
         };
+        pushLog(job, "Start failed: missing register config (worker_domain/email_domain/admin_password)");
         await this.saveJob(job);
         return Response.json(jobToDict(job), { status: 200 });
       }
@@ -155,6 +168,7 @@ export class AutoRegisterJob implements DurableObject {
         errors: 0,
         error: null,
         last_error: null,
+        logs: [],
         started_at: nowMs(),
         finished_at: null,
         stop_requested: false,
@@ -165,6 +179,10 @@ export class AutoRegisterJob implements DurableObject {
         action: null,
       };
 
+      pushLog(job, `Job created: total=${total} pool=${pool} concurrency=${threads}`);
+      if (register.yescaptcha_key) pushLog(job, "Using YesCaptcha (register.yescaptcha_key set)");
+      else pushLog(job, `Using solver_url=${register.solver_url}`);
+      if (grok.cf_clearance) pushLog(job, "Using cf_clearance for challenge bypass (best-effort)");
       await this.saveJob(job);
       await this.state.storage.setAlarm(Date.now() + 100);
       return Response.json(jobToDict(job), { status: 200 });
@@ -184,6 +202,7 @@ export class AutoRegisterJob implements DurableObject {
       }
       job.stop_requested = true;
       if (job.status === "running" || job.status === "starting") job.status = "stopping";
+      pushLog(job, "Stop requested");
       await this.saveJob(job);
       await this.state.storage.setAlarm(Date.now() + 100);
       return Response.json(jobToDict(job), { status: 200 });
@@ -201,6 +220,7 @@ export class AutoRegisterJob implements DurableObject {
     if (job.stop_requested || job.status === "stopping") {
       job.status = "stopped";
       job.finished_at = nowMs();
+      pushLog(job, "Job stopped");
       await this.saveJob(job);
       return;
     }
@@ -210,6 +230,7 @@ export class AutoRegisterJob implements DurableObject {
       job.status = "error";
       job.error = `Timeout after ${job.max_runtime_minutes} minutes.`;
       job.finished_at = nowMs();
+      pushLog(job, job.error);
       await this.saveJob(job);
       return;
     }
@@ -218,16 +239,21 @@ export class AutoRegisterJob implements DurableObject {
       job.status = "error";
       job.error = `Too many failures (${job.errors}/${job.max_errors}). Check register config/solver.`;
       job.finished_at = nowMs();
+      pushLog(job, job.error);
       await this.saveJob(job);
       return;
     }
 
-    if (job.status === "starting") job.status = "running";
+    if (job.status === "starting") {
+      job.status = "running";
+      pushLog(job, "Job running");
+    }
 
     const remaining = Math.max(0, job.total - job.completed);
     if (remaining === 0) {
       job.status = "completed";
       job.finished_at = nowMs();
+      pushLog(job, "Job completed");
       await this.saveJob(job);
       return;
     }
@@ -238,6 +264,7 @@ export class AutoRegisterJob implements DurableObject {
     } catch (e) {
       job.errors += 1;
       job.last_error = shortError(e);
+      pushLog(job, `Init failed: ${job.last_error}`);
       await this.saveJob(job);
       await this.state.storage.setAlarm(Date.now() + 2000);
       return;
@@ -264,15 +291,18 @@ export class AutoRegisterJob implements DurableObject {
       if (typeof r === "string") {
         job.completed += 1;
         job.added += 1;
+        pushLog(job, `Registered OK (${job.completed}/${job.total})`);
       } else if (typeof r === "object" && r && "error" in r) {
         job.errors += 1;
         job.last_error = shortError((r as any).error);
+        pushLog(job, `Register failed: ${job.last_error}`);
       }
     }
 
     if (job.stop_requested) {
       job.status = "stopped";
       job.finished_at = nowMs();
+      pushLog(job, "Job stopped");
       await this.saveJob(job);
       return;
     }
@@ -280,6 +310,7 @@ export class AutoRegisterJob implements DurableObject {
     if (job.completed >= job.total) {
       job.status = "completed";
       job.finished_at = nowMs();
+      pushLog(job, "Job completed");
       await this.saveJob(job);
       return;
     }

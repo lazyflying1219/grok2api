@@ -131,6 +131,13 @@ function parseSetCookieHeaders(headers: Headers): string[] {
 class CookieJar {
   private map = new Map<string, string>();
 
+  set(name: string, value: string) {
+    const n = String(name || "").trim();
+    const v = String(value || "").trim();
+    if (!n || !v) return;
+    this.map.set(n, v);
+  }
+
   setFromHeader(setCookie: string) {
     const first = String(setCookie || "").split(";", 1)[0] ?? "";
     const idx = first.indexOf("=");
@@ -184,14 +191,29 @@ async function fetchFollowRedirects(url: string, init: RequestInit, jar: CookieJ
   return fetchWithJar(curUrl, init, jar);
 }
 
-async function initActionConfig(userAgent: string): Promise<ActionConfig> {
-  const res = await fetch(SIGNUP_URL, {
-    headers: {
-      "user-agent": userAgent,
-      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    },
-  });
+function parseHtmlTitle(html: string): string {
+  return html.match(/<title>([^<]+)<\/title>/i)?.[1]?.trim() ?? "";
+}
+
+async function initActionConfig(userAgent: string, opts?: { cf_clearance?: string }): Promise<ActionConfig> {
+  const headers: Record<string, string> = {
+    "user-agent": userAgent,
+    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  };
+  const clearance = String(opts?.cf_clearance ?? "").trim();
+  if (clearance) headers.cookie = `cf_clearance=${clearance}`;
+
+  const res = await fetch(SIGNUP_URL, { headers });
   const html = await res.text();
+  const title = parseHtmlTitle(html);
+  const cfRay = res.headers.get("cf-ray") ?? "";
+  const blockedHint = title && /cloudflare|attention required|just a moment/i.test(title);
+
+  if (!res.ok) {
+    const hint = blockedHint ? " (blocked by Cloudflare challenge)" : "";
+    const ray = cfRay ? ` cf_ray=${cfRay}` : "";
+    throw new Error(`Register init failed: sign-up HTTP ${res.status} title="${title || "unknown"}"${hint}${ray}`);
+  }
 
   const siteKey = html.match(/sitekey\":\"(0x4[a-zA-Z0-9_-]+)\"/)?.[1] ?? DEFAULT_SITE_KEY;
   const stateTree = html.match(/next-router-state-tree\":\"([^\"]+)\"/)?.[1] ?? "";
@@ -201,10 +223,18 @@ async function initActionConfig(userAgent: string): Promise<ActionConfig> {
     .filter((src) => src.includes("_next/static"))
     .slice(0, 30);
 
+  if (!scriptSrcs.length) {
+    throw new Error(
+      `Register init failed: no _next/static scripts found (title="${title || "unknown"}"${cfRay ? ` cf_ray=${cfRay}` : ""})`,
+    );
+  }
+
   let actionId = "";
   for (const src of scriptSrcs) {
     const jsUrl = new URL(src, SIGNUP_URL).toString();
-    const js = await fetch(jsUrl, { headers: { "user-agent": userAgent } }).then((r) => r.text());
+    const jsHeaders: Record<string, string> = { "user-agent": userAgent };
+    if (clearance) jsHeaders.cookie = `cf_clearance=${clearance}`;
+    const js = await fetch(jsUrl, { headers: jsHeaders }).then((r) => r.text());
     const match = js.match(/7f[a-fA-F0-9]{40}/);
     if (match?.[0]) {
       actionId = match[0];
@@ -213,7 +243,11 @@ async function initActionConfig(userAgent: string): Promise<ActionConfig> {
     await sleep(100);
   }
 
-  if (!actionId) throw new Error("Register init failed: missing action_id");
+  if (!actionId) {
+    throw new Error(
+      `Register init failed: missing action_id (scripts=${scriptSrcs.length} title="${title || "unknown"}"${cfRay ? ` cf_ray=${cfRay}` : ""})`,
+    );
+  }
   return { site_key: siteKey, state_tree: stateTree, action_id: actionId };
 }
 
@@ -377,6 +411,8 @@ export async function registerOne(args: {
 }): Promise<{ token: string }> {
   const ua = args.user_agent || pickUserAgent();
   const jar = new CookieJar();
+  const clearance = String(args.grok?.cf_clearance ?? "").trim();
+  if (clearance) jar.set("cf_clearance", clearance);
 
   try {
     await fetchWithJar(SITE_URL, { headers: { "user-agent": ua } }, jar);
@@ -456,10 +492,14 @@ export async function registerOne(args: {
   throw new Error("Registration failed after retries");
 }
 
-export async function getActionConfigCached(current: ActionConfig | null, maxAgeMs = 10 * 60 * 1000): Promise<ActionConfig> {
+export async function getActionConfigCached(
+  current: ActionConfig | null,
+  maxAgeMs = 10 * 60 * 1000,
+  opts?: { cf_clearance?: string },
+): Promise<ActionConfig> {
   if (current && (current as any)?._ts && Date.now() - Number((current as any)._ts) < maxAgeMs) return current;
   const ua = pickUserAgent();
-  const fresh = await initActionConfig(ua);
+  const fresh = await initActionConfig(ua, opts);
   (fresh as any)._ts = Date.now();
   return fresh;
 }
