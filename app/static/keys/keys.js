@@ -218,7 +218,7 @@ function renderTable() {
       <td class="text-left mono">${escapeHtml(limitText)}</td>
       <td class="text-left mono">${escapeHtml(usedText)}</td>
       <td class="text-center text-sm">${escapeHtml(fmtDate(row.created_at))}</td>
-      <td class="text-center">
+      <td class="text-center whitespace-nowrap">
         <button class="geist-button-outline text-xs px-3 py-1" data-action="edit">编辑</button>
         <button class="geist-button-danger text-xs px-3 py-1 ml-2" data-action="delete">删除</button>
       </td>
