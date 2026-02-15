@@ -138,7 +138,9 @@ class AutoRegisterManager:
         # Give the runner a short grace period to exit.
         if task:
             try:
-                await asyncio.wait_for(task, timeout=5.0)
+                # Do not let timeout cancel the underlying job task, otherwise
+                # it may exit via CancelledError and keep a transient status forever.
+                await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
             except Exception:
                 # Don't block shutdown; the process is exiting anyway.
                 pass
@@ -261,6 +263,11 @@ class AutoRegisterManager:
                         raise
                     logger.warning("Solver start failed, continuing with YesCaptcha: {}", exc)
 
+            # Stop can be requested while startup (solver boot/config init) is in progress.
+            if job.stop_event.is_set():
+                job.status = "stopped"
+                return
+
             job.status = "running"
             watchdog_task = asyncio.create_task(_watchdog())
             consumer_task = asyncio.create_task(_consume_tokens())
@@ -297,6 +304,16 @@ class AutoRegisterManager:
             logger.exception("Auto registration failed")
         finally:
             job.finished_at = time.time()
+            # Normalize transient states so the next start is not blocked forever.
+            with job._lock:
+                if job.status in {"starting", "running", "stopping"}:
+                    if job.stop_event.is_set():
+                        job.status = "stopped"
+                    else:
+                        job.status = "error"
+                        if not job.error:
+                            suffix = f" Last error: {job.last_error}" if job.last_error else ""
+                            job.error = f"Registration terminated unexpectedly ({job.completed}/{job.total}).{suffix}".strip()
             # Ensure consumer exits even on exceptions.
             try:
                 token_queue.put(sentinel)
@@ -315,6 +332,8 @@ class AutoRegisterManager:
                     watchdog_task.cancel()
             except Exception:
                 pass
+            if self._task is asyncio.current_task():
+                self._task = None
             self._solver = None
             if auto_start_solver:
                 try:
