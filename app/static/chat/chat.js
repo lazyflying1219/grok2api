@@ -715,7 +715,7 @@ async function refreshModels() {
       const id = String(m.id || '');
       if (currentTab === 'image') return id === 'grok-imagine-1.0';
       if (currentTab === 'video') return id === 'grok-imagine-1.0-video';
-      return !/imagine/i.test(id) || id === 'grok-4-heavy';
+      return !/imagine/i.test(id);
     });
 
     filtered.forEach((m) => {
@@ -1178,4 +1178,3 @@ if (document.readyState === 'loading') {
 } else {
   init();
 }
-

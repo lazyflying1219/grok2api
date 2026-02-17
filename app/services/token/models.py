@@ -114,7 +114,7 @@ class TokenInfo(BaseModel):
 
     def update_heavy_quota(self, new_quota: int):
         """
-        更新 heavy 配额（用于 grok-4-heavy 的 rate-limits 同步）。
+        更新 heavy 配额（保留字段，兼容历史数据）。
 
         注意：heavy 配额不参与 status 计算，避免误伤普通模型可用性。
         """

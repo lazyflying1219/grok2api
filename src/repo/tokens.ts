@@ -51,22 +51,13 @@ export function tokenRowToInfo(row: TokenRow): {
   const cooldown_remaining = cooldownRemainingMs ? Math.floor((cooldownRemainingMs + 999) / 1000) : 0;
   const limit_reason = cooldownRemainingMs
     ? "cooldown"
-    : row.token_type === "ssoSuper"
-      ? row.remaining_queries === 0 || row.heavy_remaining_queries === 0
-        ? "exhausted"
-        : ""
-      : row.remaining_queries === 0
+    : row.remaining_queries === 0
         ? "exhausted"
         : "";
 
   const status = (() => {
     if (row.status === "expired") return "失效";
     if (cooldownRemainingMs) return "冷却中";
-    if (row.token_type === "ssoSuper") {
-      if (row.remaining_queries === -1 && row.heavy_remaining_queries === -1) return "未使用";
-      if (row.remaining_queries === 0 || row.heavy_remaining_queries === 0) return "额度耗尽";
-      return "正常";
-    }
     if (row.remaining_queries === -1) return "未使用";
     if (row.remaining_queries === 0) return "额度耗尽";
     return "正常";
@@ -149,8 +140,7 @@ export async function getAllTags(db: Env["DB"]): Promise<string[]> {
 
 export async function selectBestToken(db: Env["DB"], model: string): Promise<{ token: string; token_type: TokenType } | null> {
   const now = nowMs();
-  const isHeavy = model === "grok-4-heavy";
-  const field = isHeavy ? "heavy_remaining_queries" : "remaining_queries";
+  const field = "remaining_queries";
 
   const pick = async (token_type: TokenType): Promise<{ token: string; token_type: TokenType } | null> => {
     const row = await dbFirst<{ token: string }>(
@@ -167,8 +157,6 @@ export async function selectBestToken(db: Env["DB"], model: string): Promise<{ t
     );
     return row ? { token: row.token, token_type } : null;
   };
-
-  if (isHeavy) return pick("ssoSuper");
 
   return (await pick("sso")) ?? (await pick("ssoSuper"));
 }

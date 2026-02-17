@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import type { Env } from "../env";
 import { requireApiAuth } from "../auth";
 import { getSettings, normalizeCfCookie } from "../settings";
-import { isValidModel, MODEL_CONFIG } from "../grok/models";
+import { isValidModel, MODEL_CONFIG, getModelInfo, normalizeModelId } from "../grok/models";
 import { extractContent, buildConversationPayload, sendConversationRequest } from "../grok/conversation";
 import { uploadImage } from "../grok/upload";
 import { getDynamicHeaders } from "../grok/headers";
@@ -20,7 +20,7 @@ import { addRequestLog } from "../repo/logs";
 import { applyCooldown, recordTokenFailure, selectBestToken } from "../repo/tokens";
 import type { ApiAuthInfo } from "../auth";
 import { getApiKeyLimits } from "../repo/apiKeys";
-import { localDayString, tryConsumeDailyUsage, tryConsumeDailyUsageMulti } from "../repo/apiKeyUsage";
+import { localDayString, tryConsumeDailyUsage } from "../repo/apiKeyUsage";
 import { nextLocalMidnightExpirationSeconds } from "../kv/cleanup";
 import { nowMs } from "../utils/time";
 import { arrayBufferToBase64 } from "../utils/base64";
@@ -131,21 +131,6 @@ async function enforceQuota(args: {
   const day = localDayString(nowMs(), tz);
   const atMs = nowMs();
   const jsonHeaders = { "content-type": "application/json; charset=utf-8" };
-
-  if (args.model === "grok-4-heavy") {
-    const ok = await tryConsumeDailyUsageMulti({
-      db: args.env.DB,
-      key,
-      day,
-      atMs,
-      updates: [
-        { field: "heavy_used", inc: 1, limit: limits.heavy_limit },
-        { field: "chat_used", inc: 1, limit: limits.chat_limit },
-      ],
-    });
-    if (!ok) return { ok: false, resp: new Response(JSON.stringify(quotaError("heavy/chat")), { status: 429, headers: jsonHeaders }) };
-    return { ok: true };
-  }
 
   if (args.kind === "video") {
     const ok = await tryConsumeDailyUsage({
@@ -1013,8 +998,7 @@ function streamHeaders(): Record<string, string> {
 }
 
 function isValidImageModel(model: string): boolean {
-  if (!isValidModel(model)) return false;
-  const cfg = MODEL_CONFIG[model];
+  const cfg = getModelInfo(model);
   return Boolean(cfg?.is_image_model);
 }
 
@@ -1164,10 +1148,11 @@ openAiRoutes.get("/models", async (c) => {
 openAiRoutes.get("/models/:modelId", async (c) => {
   const modelId = c.req.param("modelId");
   if (!isValidModel(modelId)) return c.json(openAiError(`Model '${modelId}' not found`, "model_not_found"), 404);
-  const cfg = MODEL_CONFIG[modelId]!;
+  const normalizedModelId = normalizeModelId(modelId);
+  const cfg = MODEL_CONFIG[normalizedModelId]!;
   const ts = Math.floor(Date.now() / 1000);
   return c.json({
-    id: modelId,
+    id: normalizedModelId,
     object: "model",
     created: ts,
     owned_by: "x-ai",
@@ -1212,9 +1197,10 @@ openAiRoutes.post("/chat/completions", async (c) => {
     if (!Array.isArray(body.messages)) return c.json(openAiError("Missing 'messages'", "missing_messages"), 400);
     if (!isValidModel(requestedModel))
       return c.json(openAiError(`Model '${requestedModel}' not supported`, "model_not_supported"), 400);
+    requestedModel = normalizeModelId(requestedModel);
 
     const settingsBundle = await getSettings(c.env);
-    const cfg = MODEL_CONFIG[requestedModel]!;
+    const cfg = getModelInfo(requestedModel)!;
 
     const retryCodes = Array.isArray(settingsBundle.grok.retry_status_codes)
       ? settingsBundle.grok.retry_status_codes
@@ -1225,7 +1211,6 @@ openAiRoutes.post("/chat/completions", async (c) => {
     let lastErr: string | null = null;
 
     // === Quota check (best-effort) ===
-    // - heavy: consumes both heavy + chat
     // - image model: counts as 2 images per request (grok upstream emits up to 2)
     // - video model: 1 video per request
     // - others: 1 chat per request

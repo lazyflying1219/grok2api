@@ -39,6 +39,10 @@ class ModelInfo(BaseModel):
 
 class ModelService:
     """模型管理服务"""
+
+    _ALIASES = {
+        "grok-420": "grok-4.2",
+    }
     
     MODELS = [
         ModelInfo(
@@ -82,15 +86,6 @@ class ModelService:
             display_name="Grok 4 Fast"
         ),
         ModelInfo(
-            model_id="grok-4-heavy",
-            grok_model="grok-4",
-            rate_limit_model="grok-4-heavy",
-            model_mode="MODEL_MODE_HEAVY",
-            cost=Cost.HIGH,
-            tier=Tier.SUPER,
-            display_name="Grok 4 Heavy"
-        ),
-        ModelInfo(
             model_id="grok-4.1",
             grok_model="grok-4-1-thinking-1129",
             rate_limit_model="grok-4-1-thinking-1129",
@@ -121,6 +116,14 @@ class ModelService:
             model_mode="MODEL_MODE_GROK_4_1_THINKING",
             cost=Cost.HIGH, 
             display_name="Grok 4.1 Thinking"
+        ),
+        ModelInfo(
+            model_id="grok-4.2",
+            grok_model="grok-4.2",
+            rate_limit_model="grok-4.2",
+            model_mode="MODEL_MODE_AUTO",
+            cost=Cost.LOW,
+            display_name="Grok 4.2"
         ),
         ModelInfo(
             model_id="grok-imagine-1.0",
@@ -155,11 +158,15 @@ class ModelService:
     ]
     
     _map = {m.model_id: m for m in MODELS}
+
+    @classmethod
+    def _resolve_model_id(cls, model_id: str) -> str:
+        return cls._ALIASES.get(model_id, model_id)
     
     @classmethod
     def get(cls, model_id: str) -> Optional[ModelInfo]:
         """获取模型信息"""
-        return cls._map.get(model_id)
+        return cls._map.get(cls._resolve_model_id(model_id))
     
     @classmethod
     def list(cls) -> list[ModelInfo]:
@@ -169,7 +176,7 @@ class ModelService:
     @classmethod
     def valid(cls, model_id: str) -> bool:
         """模型是否有效"""
-        return model_id in cls._map
+        return cls.get(model_id) is not None
 
     @classmethod
     def to_grok(cls, model_id: str) -> Tuple[str, str]:
@@ -187,8 +194,8 @@ class ModelService:
 
     @classmethod
     def is_heavy_bucket_model(cls, model_id: str) -> bool:
-        """是否使用 heavy 配额桶（目前仅 grok-4-heavy）。"""
-        return model_id == "grok-4-heavy"
+        """是否使用 heavy 配额桶。"""
+        return False
 
     @classmethod
     def pool_for_model(cls, model_id: str) -> str:

@@ -21,11 +21,10 @@ async def enforce_daily_quota(
     """
     Enforce per-day quotas for a non-admin API key.
 
-    - chat/heavy/video: count by request (1)
+    - chat/video: count by request (1)
     - image: count by generated images
       - chat endpoint + image model: charge 2 images per request
       - image endpoint: charge `image_count` (n)
-    - heavy: consumes both heavy + chat buckets
     """
 
     token = str(api_key or "").strip()
@@ -40,10 +39,7 @@ async def enforce_daily_quota(
     incs: Dict[str, int] = {}
     bucket_name = "chat"
 
-    if model == "grok-4-heavy":
-        incs = {"heavy_used": 1, "chat_used": 1}
-        bucket_name = "heavy/chat"
-    elif model_info and model_info.is_video:
+    if model_info and model_info.is_video:
         incs = {"video_used": 1}
         bucket_name = "video"
     elif model_info and model_info.is_image:
@@ -67,4 +63,3 @@ async def enforce_daily_quota(
 
 
 __all__ = ["enforce_daily_quota"]
-

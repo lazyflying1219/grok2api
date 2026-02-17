@@ -12,6 +12,10 @@ export interface ModelInfo {
   is_video_model?: boolean;
 }
 
+export const MODEL_ALIASES: Record<string, string> = {
+  "grok-420": "grok-4.2",
+};
+
 export const MODEL_CONFIG: Record<string, ModelInfo> = {
   "grok-3": {
     grok_model: ["grok-3", "MODEL_MODE_AUTO"],
@@ -68,17 +72,6 @@ export const MODEL_CONFIG: Record<string, ModelInfo> = {
     supported_max_output_tokens: 131072,
     default_top_p: 0.95,
   },
-  "grok-4-heavy": {
-    grok_model: ["grok-4", "MODEL_MODE_HEAVY"],
-    rate_limit_model: "grok-4-heavy",
-    display_name: "Grok 4 Heavy",
-    description: "Most powerful Grok model (Super tokens required)",
-    raw_model_path: "xai/grok-4",
-    default_temperature: 1.0,
-    default_max_output_tokens: 65536,
-    supported_max_output_tokens: 131072,
-    default_top_p: 0.95,
-  },
   "grok-4.1": {
     grok_model: ["grok-4-1-thinking-1129", "MODEL_MODE_AUTO"],
     rate_limit_model: "grok-4-1-thinking-1129",
@@ -123,6 +116,17 @@ export const MODEL_CONFIG: Record<string, ModelInfo> = {
     supported_max_output_tokens: 131072,
     default_top_p: 0.95,
   },
+  "grok-4.2": {
+    grok_model: ["grok-4.2", "MODEL_MODE_AUTO"],
+    rate_limit_model: "grok-4.2",
+    display_name: "Grok 4.2",
+    description: "Grok 4.2 chat model",
+    raw_model_path: "xai/grok-4.2",
+    default_temperature: 1.0,
+    default_max_output_tokens: 8192,
+    supported_max_output_tokens: 131072,
+    default_top_p: 0.95,
+  },
   "grok-imagine-1.0": {
     grok_model: ["grok-3", "MODEL_MODE_FAST"],
     rate_limit_model: "grok-3",
@@ -161,21 +165,25 @@ export const MODEL_CONFIG: Record<string, ModelInfo> = {
   },
 };
 
+export function normalizeModelId(model: string): string {
+  const id = String(model ?? "").trim();
+  return MODEL_ALIASES[id] ?? id;
+}
+
 export function isValidModel(model: string): boolean {
-  return Boolean(MODEL_CONFIG[model]);
+  return Boolean(MODEL_CONFIG[normalizeModelId(model)]);
 }
 
 export function getModelInfo(model: string): ModelInfo | null {
-  return MODEL_CONFIG[model] ?? null;
+  return MODEL_CONFIG[normalizeModelId(model)] ?? null;
 }
 
 export function toGrokModel(model: string): { grokModel: string; mode: string; isVideoModel: boolean } {
-  const cfg = MODEL_CONFIG[model];
+  const cfg = getModelInfo(model);
   if (!cfg) return { grokModel: model, mode: "MODEL_MODE_FAST", isVideoModel: false };
   return { grokModel: cfg.grok_model[0], mode: cfg.grok_model[1], isVideoModel: Boolean(cfg.is_video_model) };
 }
 
 export function toRateLimitModel(model: string): string {
-  return MODEL_CONFIG[model]?.rate_limit_model ?? model;
+  return getModelInfo(model)?.rate_limit_model ?? model;
 }
-
