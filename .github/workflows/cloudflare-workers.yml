@@ -8,8 +8,6 @@ permissions:
 
 jobs:
   deploy-cloudflare:
-    # Temporarily disabled.
-    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
