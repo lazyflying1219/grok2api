@@ -29,6 +29,7 @@ class TokenManager:
         self._save_lock = asyncio.Lock()
         self._dirty = False
         self._save_task: Optional[asyncio.Task] = None
+        self._usage_sync_tasks: set[asyncio.Task] = set()
         self._save_delay = 0.5
         self._last_reload_at = 0.0
     
@@ -259,6 +260,66 @@ class TokenManager:
         logger.warning(f"Token {raw_token[:10]}...: not found for consumption")
         return False
 
+    def _track_usage_sync_task(self, task: asyncio.Task):
+        """追踪后台用量同步任务，防止未处理异常泄漏。"""
+        self._usage_sync_tasks.add(task)
+
+        def _done(t: asyncio.Task):
+            self._usage_sync_tasks.discard(t)
+            try:
+                _ = t.result()
+            except Exception as e:
+                logger.warning(f"Usage sync background task failed: {e}")
+
+        task.add_done_callback(_done)
+
+    async def _sync_usage_from_api(
+        self,
+        token_str: str,
+        target_token: TokenInfo,
+        bucket: str,
+        rate_limit_model: str,
+        is_usage: bool
+    ) -> bool:
+        """从上游同步真实额度。"""
+        raw_token = token_str.replace("sso=", "")
+
+        try:
+            from app.services.grok.usage import UsageService
+
+            usage_service = UsageService()
+            result = await usage_service.get(token_str, model_name=rate_limit_model)
+
+            if not (result and "remainingTokens" in result):
+                return False
+
+            try:
+                new_quota = int(result["remainingTokens"])
+            except Exception:
+                new_quota = 0
+
+            if bucket == "heavy":
+                old_quota = target_token.heavy_quota
+                target_token.update_heavy_quota(new_quota)
+            else:
+                old_quota = target_token.quota
+                target_token.update_quota(new_quota)
+
+            target_token.record_success(is_usage=is_usage)
+
+            consumed = max(0, old_quota - new_quota) if old_quota >= 0 else 0
+            logger.info(
+                f"Token {raw_token[:10]}...: synced quota (bucket={bucket}, model={rate_limit_model}) "
+                f"{old_quota} -> {new_quota} (consumed: {consumed}, use_count: {target_token.use_count})"
+            )
+
+            self._schedule_save()
+            return True
+
+        except Exception as e:
+            logger.warning(f"Token {raw_token[:10]}...: API sync failed, fallback to local ({e})")
+            return False
+
     async def sync_usage(
         self, 
         token_str: str, 
@@ -300,47 +361,40 @@ class TokenManager:
         bucket = "heavy" if ModelService.is_heavy_bucket_model(model_id) else "normal"
         rate_limit_model = ModelService.rate_limit_model_for(model_id)
 
-        # 尝试 API 同步
-        try:
-            from app.services.grok.usage import UsageService
-            
-            usage_service = UsageService()
-            result = await usage_service.get(token_str, model_name=rate_limit_model)
-            
-            if result and "remainingTokens" in result:
-                try:
-                    new_quota = int(result["remainingTokens"])
-                except Exception:
-                    new_quota = 0
+        # 请求链路：先本地扣额，再异步纠偏到真实额度，避免把用户请求阻塞在 /rest/rate-limits。
+        if consume_on_fail and is_usage:
+            local_ok = await self.consume(token_str, fallback_effort, bucket=bucket)
+            if not local_ok:
+                return False
 
-                if bucket == "heavy":
-                    old_quota = target_token.heavy_quota
-                    target_token.update_heavy_quota(new_quota)
-                else:
-                    old_quota = target_token.quota
-                    target_token.update_quota(new_quota)
-
-                target_token.record_success(is_usage=is_usage)
-
-                consumed = max(0, old_quota - new_quota) if old_quota >= 0 else 0
-                logger.info(
-                    f"Token {raw_token[:10]}...: synced quota (bucket={bucket}, model={rate_limit_model}) "
-                    f"{old_quota} -> {new_quota} (consumed: {consumed}, use_count: {target_token.use_count})"
+            task = asyncio.create_task(
+                self._sync_usage_from_api(
+                    token_str=token_str,
+                    target_token=target_token,
+                    bucket=bucket,
+                    rate_limit_model=rate_limit_model,
+                    is_usage=False,  # 已本地计次，远端同步只纠偏额度
                 )
-                
-                self._schedule_save()
-                return True
-                
-        except Exception as e:
-            logger.warning(f"Token {raw_token[:10]}...: API sync failed, fallback to local ({e})")
-            
-        # 降级：本地预估扣费
+            )
+            self._track_usage_sync_task(task)
+            return True
+
+        # 管理操作（如手动刷新）仍保持同步语义。
+        synced = await self._sync_usage_from_api(
+            token_str=token_str,
+            target_token=target_token,
+            bucket=bucket,
+            rate_limit_model=rate_limit_model,
+            is_usage=is_usage,
+        )
+        if synced:
+            return True
+
         if consume_on_fail:
             logger.debug(f"Token {raw_token[:10]}...: using local consumption")
             return await self.consume(token_str, fallback_effort, bucket=bucket)
-        else:
-            logger.debug(f"Token {raw_token[:10]}...: sync failed, skipping local consumption")
-            return False
+        logger.debug(f"Token {raw_token[:10]}...: sync failed, skipping local consumption")
+        return False
 
     async def record_fail(self, token_str: str, status_code: int = 401, reason: str = "") -> bool:
         """
