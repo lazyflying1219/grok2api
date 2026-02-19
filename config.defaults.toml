@@ -43,6 +43,10 @@ usage_max_concurrent = 25
 assets_delete_batch_size = 10
 admin_assets_batch_size = 10
 
+[security]
+auto_ban_unknown_path = true
+auto_ban_exempt_ips = ["127.0.0.1", "::1"]
+
 [register]
 worker_domain = ""
 email_domain = ""
