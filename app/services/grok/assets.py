@@ -482,10 +482,11 @@ class ListService(BaseService):
                 )
 
                 if response.status_code != 200:
-                    logger.error(f"List failed: {response.status_code}")
+                    body = response.text[:500]
+                    logger.error(f"List failed: {response.status_code} body={body}")
                     raise UpstreamException(
                         message=f"List assets failed: {response.status_code}",
-                        details={"status": response.status_code}
+                        details={"status": response.status_code, "body": body}
                     )
 
                 result = response.json()

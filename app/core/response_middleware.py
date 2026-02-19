@@ -165,7 +165,7 @@ class ResponseLoggerMiddleware(BaseHTTPMiddleware):
 
     @staticmethod
     def _auto_ban_enabled() -> bool:
-        return bool(get_config("security.auto_ban_unknown_path", True))
+        return bool(get_config("security.auto_ban_unknown_path", False))
 
     @staticmethod
     def _is_exempt_ip(client_ip: str) -> bool:
