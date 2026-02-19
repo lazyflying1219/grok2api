@@ -118,3 +118,36 @@ def test_auto_ban_does_not_persist_when_storage_mode_not_file(monkeypatch, tmp_p
     first = client.get("/not-a-real-api")
     assert first.status_code == 403
     assert not ban_file.exists()
+
+
+def test_root_path_is_known_and_will_not_be_banned(monkeypatch):
+    monkeypatch.setenv("STORAGE_MODE", "memory")
+    client = _build_client(monkeypatch, enabled=True)
+
+    first = client.get("/")
+    assert first.status_code == 404
+
+    second = client.get("/health")
+    assert second.status_code == 200
+
+
+def test_favicon_path_is_known_and_will_not_be_banned(monkeypatch):
+    monkeypatch.setenv("STORAGE_MODE", "memory")
+    client = _build_client(monkeypatch, enabled=True)
+
+    first = client.get("/favicon.ico")
+    assert first.status_code == 404
+
+    second = client.get("/health")
+    assert second.status_code == 200
+
+
+def test_admin_prefix_is_known_and_will_not_be_banned(monkeypatch):
+    monkeypatch.setenv("STORAGE_MODE", "memory")
+    client = _build_client(monkeypatch, enabled=True)
+
+    first = client.get("/admin/not-a-real-page")
+    assert first.status_code == 404
+
+    second = client.get("/health")
+    assert second.status_code == 200

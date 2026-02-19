@@ -9,6 +9,7 @@ import asyncio
 import os
 import time
 import uuid
+import ipaddress
 from pathlib import Path
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -39,14 +40,117 @@ class ResponseLoggerMiddleware(BaseHTTPMiddleware):
         return (os.getenv("STORAGE_MODE", "") or "").strip().lower() == "file"
 
     @staticmethod
-    def _get_client_ip(request: Request) -> str:
+    def _parse_ip(value: str | None) -> str | None:
+        if not value:
+            return None
+        raw = str(value).strip()
+        if not raw:
+            return None
+        try:
+            return str(ipaddress.ip_address(raw))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _trust_proxy_headers() -> bool:
+        return bool(get_config("security.trust_proxy_headers", False))
+
+    @staticmethod
+    def _trusted_proxy_rules() -> tuple[set[str], list[ipaddress._BaseNetwork]]:
+        raw = get_config("security.trusted_proxy_ips", ["127.0.0.1", "::1"])
+        if isinstance(raw, str):
+            items = [p.strip() for p in raw.split(",")]
+        elif isinstance(raw, (list, tuple, set)):
+            items = [str(p).strip() for p in raw]
+        else:
+            items = []
+
+        exact: set[str] = set()
+        nets: list[ipaddress._BaseNetwork] = []
+
+        for item in items:
+            if not item:
+                continue
+
+            if "/" in item:
+                try:
+                    nets.append(ipaddress.ip_network(item, strict=False))
+                    continue
+                except ValueError:
+                    pass
+
+            ip = ResponseLoggerMiddleware._parse_ip(item)
+            if ip:
+                exact.add(ip)
+            else:
+                # Keep non-IP tokens as-is for tests or custom environments.
+                exact.add(item)
+
+        return exact, nets
+
+    @classmethod
+    def _is_trusted_proxy_peer(cls, peer: str) -> bool:
+        exact, nets = cls._trusted_proxy_rules()
+        if not exact and not nets:
+            return False
+
+        raw = str(peer or "").strip()
+        if not raw:
+            return False
+
+        if raw in exact:
+            return True
+
+        ip_str = cls._parse_ip(raw)
+        if not ip_str:
+            return False
+
+        ip = ipaddress.ip_address(ip_str)
+        return any(ip in net for net in nets)
+
+    @classmethod
+    def _get_client_ip(cls, request: Request) -> str:
         client = request.client
-        if client and client.host:
-            return client.host
-        return ""
+        direct_ip = client.host if client and client.host else ""
+
+        if not cls._trust_proxy_headers():
+            return direct_ip
+
+        if not cls._is_trusted_proxy_peer(direct_ip):
+            return direct_ip
+
+        # Prefer Cloudflare header if present (common in fronted deployments).
+        cf_ip = cls._parse_ip(request.headers.get("CF-Connecting-IP"))
+        if cf_ip:
+            return cf_ip
+
+        xff = request.headers.get("X-Forwarded-For")
+        if xff:
+            for part in xff.split(","):
+                ip = cls._parse_ip(part)
+                if ip:
+                    return ip
+
+        real_ip = cls._parse_ip(request.headers.get("X-Real-IP"))
+        if real_ip:
+            return real_ip
+
+        return direct_ip
 
     @staticmethod
     def _is_known_route(request: Request) -> bool:
+        # Explicit allowlist: do NOT auto-ban for these paths, even when the route
+        # isn't registered (common browser probes / admin prefixes).
+        path = (request.url.path or "").strip() or "/"
+
+        def _is_prefix_or_exact(prefix: str) -> bool:
+            return path == prefix or path.startswith(f"{prefix}/")
+
+        if path in {"/", "/favicon.ico"}:
+            return True
+        if _is_prefix_or_exact("/admin"):
+            return True
+
         scope = request.scope
         routes = getattr(getattr(request.app, "router", None), "routes", [])
         for route in routes:

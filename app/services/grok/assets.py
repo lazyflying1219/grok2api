@@ -9,6 +9,8 @@ import time
 import hashlib
 import re
 import uuid
+import ipaddress
+import socket
 from pathlib import Path
 from contextlib import asynccontextmanager
 try:
@@ -16,7 +18,7 @@ try:
 except ImportError:  # pragma: no cover - non-posix platforms
     fcntl = None
 from typing import Tuple, List, Dict, Optional, Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import aiofiles
 from curl_cffi.requests import AsyncSession
@@ -230,6 +232,76 @@ class BaseService:
             return all([result.scheme, result.netloc]) and result.scheme in ['http', 'https']
         except:
             return False
+
+    @staticmethod
+    def _allow_private_fetch() -> bool:
+        return bool(get_config("security.allow_private_fetch", False))
+
+    @classmethod
+    async def _validate_fetch_url(cls, url: str) -> str:
+        """
+        Validate user-provided URLs before fetching to prevent SSRF.
+
+        Rules (default):
+        - only http/https
+        - block loopback/private/link-local/multicast/reserved IPs
+        - for domain names, resolve and apply the same IP policy
+        """
+        raw = str(url or "").strip()
+        if not raw:
+            raise ValidationException("Invalid URL: empty", param="url", code="invalid_url")
+
+        parsed = urlparse(raw)
+        if parsed.scheme not in ("http", "https"):
+            raise ValidationException("Only http/https URLs are allowed", param="url", code="invalid_url")
+
+        host = (parsed.hostname or "").strip()
+        if not host:
+            raise ValidationException("Invalid URL: missing host", param="url", code="invalid_url")
+
+        if host.lower() == "localhost":
+            raise ValidationException("Localhost URLs are not allowed", param="url", code="invalid_url")
+
+        allow_private = cls._allow_private_fetch()
+
+        def _is_allowed_ip(ip: ipaddress._BaseAddress) -> bool:
+            return allow_private or bool(getattr(ip, "is_global", False))
+
+        # IP-literal host
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            ip = None
+
+        if ip is not None:
+            if not _is_allowed_ip(ip):
+                raise ValidationException("URL host is not a public IP", param="url", code="invalid_url")
+            return raw
+
+        # Domain name: resolve and validate every result.
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        try:
+            infos = await asyncio.to_thread(socket.getaddrinfo, host, port, type=socket.SOCK_STREAM)
+        except Exception:
+            raise ValidationException("Invalid URL: unable to resolve host", param="url", code="invalid_url")
+
+        resolved: set[ipaddress._BaseAddress] = set()
+        for info in infos:
+            try:
+                sockaddr = info[4]
+                addr = sockaddr[0]
+                resolved.add(ipaddress.ip_address(addr))
+            except Exception:
+                continue
+
+        if not resolved:
+            raise ValidationException("Invalid URL: unable to resolve host", param="url", code="invalid_url")
+
+        for ip2 in resolved:
+            if not _is_allowed_ip(ip2):
+                raise ValidationException("URL resolves to a non-public IP", param="url", code="invalid_url")
+
+        return raw
     
     @staticmethod
     async def fetch(url: str) -> Tuple[str, str, str]:
@@ -240,19 +312,38 @@ class BaseService:
             UpstreamException: 当获取失败时
         """
         try:
+            current = await BaseService._validate_fetch_url(url)
+            max_redirects = 3
             async with AsyncSession() as session:
-                response = await session.get(url, timeout=10)
+                response = None
+                for _ in range(max_redirects + 1):
+                    response = await session.get(current, timeout=10, allow_redirects=False)
+                    if response.status_code in (301, 302, 303, 307, 308):
+                        loc = response.headers.get("location") if hasattr(response, "headers") else None
+                        if not loc:
+                            raise UpstreamException(
+                                message=f"Failed to fetch resource: {response.status_code}",
+                                details={"url": current, "status": response.status_code},
+                            )
+                        next_url = urljoin(current, str(loc))
+                        current = await BaseService._validate_fetch_url(next_url)
+                        continue
+                    break
+
+                if response is None:
+                    raise UpstreamException(message="Failed to fetch resource", details={"url": current})
+
                 if response.status_code >= 400:
                     raise UpstreamException(
                         message=f"Failed to fetch resource: {response.status_code}",
-                        details={"url": url, "status": response.status_code}
+                        details={"url": current, "status": response.status_code},
                     )
                 
-                filename = url.split('/')[-1].split('?')[0] or 'download'
+                filename = current.split('/')[-1].split('?')[0] or 'download'
                 content_type = response.headers.get('content-type', DEFAULT_MIME).split(';')[0]
                 b64 = base64.b64encode(response.content).decode()
                 
-                logger.debug(f"Fetched: {url} -> {filename}")
+                logger.debug(f"Fetched: {current} -> {filename}")
                 return filename, b64, content_type
         except Exception as e:
             logger.error(f"Fetch failed: {url} - {e}")

@@ -54,6 +54,10 @@ class BaseProcessor:
         self.model = model
         self.token = token
         self.created = int(time.time())
+        # OpenAI-compatible response id must be stable across chunks/requests.
+        # Do NOT depend on upstream "responseId" which may be absent or appear late.
+        self.response_id: str = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        self.fingerprint: str = ""
         self.app_url = get_config("app.app_url", "")
         self._dl_service: Optional[DownloadService] = None
 
@@ -94,24 +98,21 @@ class BaseProcessor:
             
     def _sse(self, content: str = "", role: str = None, finish: str = None) -> str:
         """构建 SSE 响应 (StreamProcessor 通用)"""
-        if not hasattr(self, 'response_id'):
-            self.response_id = None
-        if not hasattr(self, 'fingerprint'):
-            self.fingerprint = ""
-            
         delta = {}
         if role:
             delta["role"] = role
-            delta["content"] = ""
-        elif content:
+        if content:
             delta["content"] = content
+        elif role:
+            # 兼容常见 OpenAI SDK：role 首包通常带一个空 content。
+            delta["content"] = ""
         
         chunk = {
-            "id": self.response_id or f"chatcmpl-{uuid.uuid4().hex[:24]}",
+            "id": self.response_id,
             "object": "chat.completion.chunk",
             "created": self.created,
             "model": self.model,
-            "system_fingerprint": self.fingerprint if hasattr(self, 'fingerprint') else "",
+            "system_fingerprint": self.fingerprint,
             "choices": [{"index": 0, "delta": delta, "logprobs": None, "finish_reason": finish}]
         }
         return f"data: {orjson.dumps(chunk).decode()}\n\n"
@@ -122,8 +123,6 @@ class StreamProcessor(BaseProcessor):
     
     def __init__(self, model: str, token: str = "", think: bool = None, prompt_tokens: int = 0):
         super().__init__(model, token)
-        self.response_id: Optional[str] = None
-        self.fingerprint: str = ""
         self.think_opened: bool = False
         self.role_sent: bool = False
         self.filter_tags = get_config("grok.filter_tags", [])
@@ -138,6 +137,14 @@ class StreamProcessor(BaseProcessor):
     
     async def process(self, response: AsyncIterable[bytes]) -> AsyncGenerator[str, None]:
         """处理流式响应"""
+        def _emit(content: str) -> str:
+            # 不要先发一个空 role chunk（会让首字耗时统计失真）。
+            # 只在第一次真正输出内容时，顺带把 role 一起发出去。
+            if not self.role_sent:
+                self.role_sent = True
+                return self._sse(content=content, role="assistant")
+            return self._sse(content=content)
+
         try:
             async for line in response:
                 if not line:
@@ -152,31 +159,24 @@ class StreamProcessor(BaseProcessor):
                 # 元数据
                 if (llm := resp.get("llmInfo")) and not self.fingerprint:
                     self.fingerprint = llm.get("modelHash", "")
-                if rid := resp.get("responseId"):
-                    self.response_id = rid
-                
-                # 首次发送 role
-                if not self.role_sent:
-                    yield self._sse(role="assistant")
-                    self.role_sent = True
                 
                 # 图像生成进度
                 if img := resp.get("streamingImageGenerationResponse"):
                     if self.show_think:
                         if not self.think_opened:
-                            yield self._sse("<think>\n")
+                            yield _emit("<think>\n")
                             self.think_opened = True
                         idx = img.get('imageIndex', 0) + 1
                         progress = img.get('progress', 0)
-                        yield self._sse(f"正在生成第{idx}张图片中，当前进度{progress}%\n")
+                        yield _emit(f"正在生成第{idx}张图片中，当前进度{progress}%\n")
                     continue
                 
                 # modelResponse
                 if mr := resp.get("modelResponse"):
                     if self.think_opened and self.show_think:
                         if msg := mr.get("message"):
-                            yield self._sse(msg + "\n")
-                        yield self._sse("</think>\n")
+                            yield _emit(msg + "\n")
+                        yield _emit("</think>\n")
                         self.think_opened = False
                     
                     # 处理生成的图片
@@ -188,13 +188,13 @@ class StreamProcessor(BaseProcessor):
                             dl_service = self._get_dl()
                             base64_data = await dl_service.to_base64(url, self.token, "image")
                             if base64_data:
-                                yield self._sse(f"![{img_id}]({base64_data})\n")
+                                yield _emit(f"![{img_id}]({base64_data})\n")
                             else:
                                 final_url = await self.process_url(url, "image")
-                                yield self._sse(f"![{img_id}]({final_url})\n")
+                                yield _emit(f"![{img_id}]({final_url})\n")
                         else:
                             final_url = await self.process_url(url, "image")
-                            yield self._sse(f"![{img_id}]({final_url})\n")
+                            yield _emit(f"![{img_id}]({final_url})\n")
                     
                     if (meta := mr.get("metadata", {})).get("llm_info", {}).get("modelHash"):
                         self.fingerprint = meta["llm_info"]["modelHash"]
@@ -204,16 +204,16 @@ class StreamProcessor(BaseProcessor):
                 if (token := resp.get("token")) is not None:
                     if token and not (self.filter_tags and any(t in token for t in self.filter_tags)):
                         self._completion_tokens += _count_tokens(token)
-                        yield self._sse(token)
+                        yield _emit(token)
 
             if self.think_opened:
-                yield self._sse("</think>\n")
+                yield _emit("</think>\n")
             yield self._sse(finish="stop")
             # usage chunk (OpenAI spec: separate chunk with choices=[] before [DONE])
             completion_tokens = self._completion_tokens
             total = self.prompt_tokens + completion_tokens
             usage_chunk = {
-                "id": self.response_id or f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                "id": self.response_id,
                 "object": "chat.completion.chunk",
                 "created": self.created,
                 "model": self.model,
@@ -244,7 +244,6 @@ class CollectProcessor(BaseProcessor):
 
     async def process(self, response: AsyncIterable[bytes]) -> dict[str, Any]:
         """处理并收集完整响应"""
-        response_id = ""
         fingerprint = ""
         content = ""
         
@@ -263,7 +262,6 @@ class CollectProcessor(BaseProcessor):
                     fingerprint = llm.get("modelHash", "")
                 
                 if mr := resp.get("modelResponse"):
-                    response_id = mr.get("responseId", "")
                     content = mr.get("message", "")
                     
                     if urls := mr.get("generatedImageUrls"):
@@ -296,7 +294,7 @@ class CollectProcessor(BaseProcessor):
         total = self.prompt_tokens + completion_tokens
 
         return {
-            "id": response_id,
+            "id": self.response_id,
             "object": "chat.completion",
             "created": self.created,
             "model": self.model,
@@ -319,7 +317,6 @@ class VideoStreamProcessor(BaseProcessor):
     
     def __init__(self, model: str, token: str = "", think: bool = None):
         super().__init__(model, token)
-        self.response_id: Optional[str] = None
         self.think_opened: bool = False
         self.role_sent: bool = False
         self.video_format = get_config("app.video_format", "url")
@@ -340,6 +337,12 @@ class VideoStreamProcessor(BaseProcessor):
     
     async def process(self, response: AsyncIterable[bytes]) -> AsyncGenerator[str, None]:
         """处理视频流式响应"""
+        def _emit(content: str) -> str:
+            if not self.role_sent:
+                self.role_sent = True
+                return self._sse(content=content, role="assistant")
+            return self._sse(content=content)
+
         try:
             async for line in response:
                 if not line:
@@ -351,30 +354,22 @@ class VideoStreamProcessor(BaseProcessor):
                 
                 resp = data.get("result", {}).get("response", {})
                 
-                if rid := resp.get("responseId"):
-                    self.response_id = rid
-                
-                # 首次发送 role
-                if not self.role_sent:
-                    yield self._sse(role="assistant")
-                    self.role_sent = True
-                
                 # 视频生成进度
                 if video_resp := resp.get("streamingVideoGenerationResponse"):
                     progress = video_resp.get("progress", 0)
                     
                     if self.show_think:
                         if not self.think_opened:
-                            yield self._sse("<think>\n")
+                            yield _emit("<think>\n")
                             self.think_opened = True
-                        yield self._sse(f"正在生成视频中，当前进度{progress}%\n")
+                        yield _emit(f"正在生成视频中，当前进度{progress}%\n")
                     
                     if progress == 100:
                         video_url = video_resp.get("videoUrl", "")
                         thumbnail_url = video_resp.get("thumbnailImageUrl", "")
                         
                         if self.think_opened and self.show_think:
-                            yield self._sse("</think>\n")
+                            yield _emit("</think>\n")
                             self.think_opened = False
                         
                         if video_url:
@@ -384,13 +379,13 @@ class VideoStreamProcessor(BaseProcessor):
                                 final_thumbnail_url = await self.process_url(thumbnail_url, "image")
                             
                             video_html = self._build_video_html(final_video_url, final_thumbnail_url)
-                            yield self._sse(video_html)
+                            yield _emit(video_html)
                             
                             logger.info(f"Video generated: {video_url}")
                     continue
                         
             if self.think_opened:
-                yield self._sse("</think>\n")
+                yield _emit("</think>\n")
             yield self._sse(finish="stop")
             yield "data: [DONE]\n\n"
         except Exception as e:
@@ -416,7 +411,6 @@ class VideoCollectProcessor(BaseProcessor):
     
     async def process(self, response: AsyncIterable[bytes]) -> dict[str, Any]:
         """处理并收集视频响应"""
-        response_id = ""
         content = ""
         
         try:
@@ -432,7 +426,6 @@ class VideoCollectProcessor(BaseProcessor):
                 
                 if video_resp := resp.get("streamingVideoGenerationResponse"):
                     if video_resp.get("progress") == 100:
-                        response_id = resp.get("responseId", "")
                         video_url = video_resp.get("videoUrl", "")
                         thumbnail_url = video_resp.get("thumbnailImageUrl", "")
                         
@@ -451,7 +444,7 @@ class VideoCollectProcessor(BaseProcessor):
             await self.close()
         
         return {
-            "id": response_id,
+            "id": self.response_id,
             "object": "chat.completion",
             "created": self.created,
             "model": self.model,

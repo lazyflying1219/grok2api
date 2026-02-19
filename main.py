@@ -20,6 +20,7 @@ if env_file.exists():
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import Depends
+from fastapi.responses import FileResponse
 
 from app.core.auth import verify_api_key
 from app.core.config import get_config
@@ -176,6 +177,16 @@ def create_app() -> FastAPI:
                 return resp
 
         app.mount("/static", _UTF8StaticFiles(directory=static_dir), name="static")
+
+        favicon_ico = static_dir / "favicon" / "favicon.ico"
+        if favicon_ico.exists():
+            @app.get("/favicon.ico", include_in_schema=False)
+            async def favicon():
+                return FileResponse(
+                    favicon_ico,
+                    media_type="image/x-icon",
+                    headers={"Cache-Control": "public, max-age=31536000, immutable"},
+                )
 
     # 注册管理路由
     from app.api.v1.admin import router as admin_router

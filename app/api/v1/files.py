@@ -16,18 +16,40 @@ BASE_DIR = Path(__file__).parent.parent.parent.parent / "data" / "tmp"
 IMAGE_DIR = BASE_DIR / "image"
 VIDEO_DIR = BASE_DIR / "video"
 
+def _cache_filename(raw: str) -> str:
+    """
+    Map a request path (may contain slashes) to the flattened on-disk cache filename.
+
+    Security note:
+    - Windows treats `\\` as a path separator, so we normalize it as well.
+    - The cache itself never needs backslashes in filenames; treating them as separators
+      makes traversal attempts deterministic across OSes.
+    """
+    s = str(raw or "")
+    # Normalize both separators, then flatten.
+    s = s.replace("\\", "/").lstrip("/")
+    return s.replace("/", "-")
+
+def _safe_cached_path(base_dir: Path, raw: str) -> Path | None:
+    name = _cache_filename(raw)
+    if not name or name in {".", ".."}:
+        return None
+
+    base = base_dir.resolve()
+    target = (base_dir / name).resolve()
+    if not target.is_relative_to(base):
+        return None
+    return target
+
 
 @router.get("/image/{filename:path}")
 async def get_image(filename: str):
     """
     获取图片文件
     """
-    if "/" in filename:
-        filename = filename.replace("/", "-")
-        
-    file_path = IMAGE_DIR / filename
+    file_path = _safe_cached_path(IMAGE_DIR, filename)
     
-    if await aiofiles.os.path.exists(file_path):
+    if file_path and await aiofiles.os.path.exists(file_path):
         if await aiofiles.os.path.isfile(file_path):
             content_type = "image/jpeg"
             if file_path.suffix.lower() == ".png":
@@ -53,12 +75,9 @@ async def get_video(filename: str):
     """
     获取视频文件
     """
-    if "/" in filename:
-        filename = filename.replace("/", "-")
-        
-    file_path = VIDEO_DIR / filename
+    file_path = _safe_cached_path(VIDEO_DIR, filename)
     
-    if await aiofiles.os.path.exists(file_path):
+    if file_path and await aiofiles.os.path.exists(file_path):
         if await aiofiles.os.path.isfile(file_path):
             return FileResponse(
                 file_path, 
