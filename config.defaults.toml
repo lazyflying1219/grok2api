@@ -27,6 +27,7 @@ refresh_interval_hours = 8
 fail_threshold = 5
 save_delay_ms = 500
 reload_interval_sec = 30
+reserve_ttl_ms = 180000
 nsfw_refresh_concurrency = 10
 nsfw_refresh_retries = 3
 

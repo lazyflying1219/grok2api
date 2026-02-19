@@ -47,6 +47,8 @@ class TokenInfo(BaseModel):
     status: TokenStatus = TokenStatus.ACTIVE
     quota: int = DEFAULT_QUOTA
     heavy_quota: int = -1
+    inflight_until: int = 0
+    inflight_request_id: Optional[str] = None
     
     # 统计
     created_at: int = Field(default_factory=lambda: int(datetime.now().timestamp() * 1000))

@@ -473,18 +473,21 @@ class ChatService:
 
         # 获取 token 并请求 Grok（失败时自动换 token 重试）
         token_mgr = await get_token_manager()
-        await token_mgr.reload_if_stale()
 
         max_retry = RetryConfig.get_max_retry()
         excluded_tokens: set[str] = set()
         token = None
+        reservation_id = None
         last_error = None
 
         service = GrokChatService()
 
         for attempt in range(max_retry + 1):
-            # 选择 token（排除已失败的）
-            token = token_mgr.get_token_for_model(model, exclude=excluded_tokens)
+            # 选择并预占 token（排除已失败的）
+            token, reservation_id = await token_mgr.reserve_token_for_model(
+                model,
+                exclude=excluded_tokens,
+            )
             if not token:
                 break
 
@@ -493,6 +496,10 @@ class ChatService:
                 last_error = None
                 break
             except UpstreamException as e:
+                try:
+                    await token_mgr.release_token_reservation(token, reservation_id)
+                except Exception:
+                    pass
                 status = e.details.get("status") if e.details else None
                 await token_mgr.record_fail(token, status or 0, str(e))
                 last_error = e
@@ -510,6 +517,10 @@ class ChatService:
                     continue
                 raise
             except AppException:
+                try:
+                    await token_mgr.release_token_reservation(token, reservation_id)
+                except Exception:
+                    pass
                 try:
                     await request_stats.record_request(model, success=False)
                 except Exception:
@@ -557,16 +568,27 @@ class ChatService:
                             await request_stats.record_request(model_name, success=False)
                     except Exception:
                         pass
+                    finally:
+                        try:
+                            await token_mgr.release_token_reservation(token, reservation_id)
+                        except Exception:
+                            pass
 
             return _wrapped_stream()
 
-        result = await CollectProcessor(model_name, token, prompt_tokens=prompt_tokens).process(response)
         try:
-            await token_mgr.sync_usage(token, model_name, consume_on_fail=True, is_usage=True)
-            await request_stats.record_request(model_name, success=True)
-        except Exception:
-            pass
-        return result
+            result = await CollectProcessor(model_name, token, prompt_tokens=prompt_tokens).process(response)
+            try:
+                await token_mgr.sync_usage(token, model_name, consume_on_fail=True, is_usage=True)
+                await request_stats.record_request(model_name, success=True)
+            except Exception:
+                pass
+            return result
+        finally:
+            try:
+                await token_mgr.release_token_reservation(token, reservation_id)
+            except Exception:
+                pass
 
 
 __all__ = [

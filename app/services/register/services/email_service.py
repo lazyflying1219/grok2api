@@ -5,12 +5,14 @@ import os
 import random
 import string
 import json
+import time
 from typing import Tuple, Optional
 
 import requests
 import urllib3
 
 from app.core.config import get_config
+from app.core.logger import logger
 
 
 class EmailService:
@@ -166,23 +168,84 @@ class EmailService:
             return None, None
         return None, None
 
-    def fetch_first_email(self, jwt: str) -> Optional[str]:
-        """Fetch the first email content for the mailbox."""
-        try:
-            res = requests.get(
-                f"https://{self.worker_domain}/api/mails",
-                params={"limit": 10, "offset": 0},
-                headers={
-                    "Authorization": f"Bearer {jwt}",
-                    "Content-Type": "application/json",
-                },
-                timeout=10,
-            )
-            if res.status_code == 200:
-                data = res.json()
+    def _fetch_first_email_via_doh(self, jwt: str) -> Optional[str]:
+        ips = self._resolve_ipv4_via_doh(self.worker_domain)
+        if not ips:
+            logger.warning("Email fetch DNS fallback failed: no A record from DoH for {}", self.worker_domain)
+            return None
+
+        headers = {
+            "Authorization": f"Bearer {jwt}",
+            "Content-Type": "application/json",
+            "Host": self.worker_domain,
+        }
+        path = "/api/mails?limit=10&offset=0"
+
+        for ip in ips:
+            pool: urllib3.HTTPSConnectionPool | None = None
+            try:
+                pool = urllib3.HTTPSConnectionPool(
+                    host=ip,
+                    port=443,
+                    assert_hostname=self.worker_domain,
+                    server_hostname=self.worker_domain,
+                    cert_reqs="CERT_REQUIRED",
+                    retries=False,
+                    timeout=urllib3.util.Timeout(connect=5, read=10),
+                )
+                res = pool.request(
+                    "GET",
+                    path,
+                    headers=headers,
+                    preload_content=True,
+                )
+                if res.status != 200:
+                    continue
+                text = res.data.decode("utf-8", errors="replace")
+                data = json.loads(text)
                 if data.get("results"):
                     return data["results"][0].get("raw")
-            return None
-        except Exception as exc:  # pragma: no cover - network/remote errors
-            print(f"Email fetch failed: {exc}")
-            return None
+            except Exception as exc:
+                logger.debug("Email fetch DoH fallback error ({}): {}", ip, exc)
+            finally:
+                if pool is not None:
+                    pool.close()
+        return None
+
+    def fetch_first_email(self, jwt: str) -> Optional[str]:
+        """Fetch the first email content for the mailbox."""
+        url = f"https://{self.worker_domain}/api/mails"
+        max_attempts = 3
+        for idx in range(max_attempts):
+            try:
+                res = requests.get(
+                    url,
+                    params={"limit": 10, "offset": 0},
+                    headers={
+                        "Authorization": f"Bearer {jwt}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=(5, 10),
+                )
+                if res.status_code == 200:
+                    data = res.json()
+                    if data.get("results"):
+                        return data["results"][0].get("raw")
+                    return None
+                if idx < max_attempts - 1:
+                    time.sleep(0.5 * (idx + 1))
+                    continue
+                logger.warning("Email fetch failed: status={} body={}", res.status_code, res.text[:200])
+                return None
+            except requests.exceptions.RequestException as exc:
+                if self._is_dns_resolution_error(exc):
+                    return self._fetch_first_email_via_doh(jwt)
+                if idx < max_attempts - 1:
+                    time.sleep(0.5 * (idx + 1))
+                    continue
+                logger.warning("Email fetch failed ({}): {}", url, exc)
+                return None
+            except Exception as exc:  # pragma: no cover - network/remote errors
+                logger.warning("Email fetch failed ({}): {}", url, exc)
+                return None
+        return None

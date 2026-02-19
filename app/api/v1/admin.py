@@ -187,9 +187,10 @@ async def admin_imagine_ws(websocket: WebSocket):
         )
 
         while not stop_event.is_set():
+            token = None
+            reservation_id = None
             try:
-                await token_mgr.reload_if_stale()
-                token = token_mgr.get_token_for_model(model_info.model_id)
+                token, reservation_id = await token_mgr.reserve_token_for_model(model_info.model_id)
                 if not token:
                     await _send(
                         {
@@ -256,6 +257,12 @@ async def admin_imagine_ws(websocket: WebSocket):
                     }
                 )
                 await asyncio.sleep(1.5)
+            finally:
+                if token:
+                    try:
+                        await token_mgr.release_token_reservation(token, reservation_id)
+                    except Exception:
+                        pass
 
         await _send({"type": "status", "status": "stopped", "run_id": run_id})
 

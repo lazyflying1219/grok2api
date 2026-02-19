@@ -397,8 +397,7 @@ class VideoService:
         # 获取 token
         try:
             token_mgr = await get_token_manager()
-            await token_mgr.reload_if_stale()
-            token = token_mgr.get_token_for_model(model)
+            token, reservation_id = await token_mgr.reserve_token_for_model(model)
         except Exception as e:
             logger.error(f"Failed to get token: {e}")
             try:
@@ -422,91 +421,105 @@ class VideoService:
                 code="rate_limit_exceeded",
                 status_code=429
         )
-        
-        # 解析参数
-        think = None
-        if thinking == "enabled":
-            think = True
-        elif thinking == "disabled":
-            think = False
-        
-        is_stream = stream if stream is not None else get_config("grok.stream", True)
-        
-        # 提取内容
-        from app.services.grok.chat import MessageExtractor
-        from app.services.grok.assets import UploadService
-        
-        try:
-            prompt, attachments = MessageExtractor.extract(messages, is_video=True)
-        except ValueError as e:
-            raise ValidationException(str(e))
-        
-        # 处理图片附件
-        image_url = None
-        if attachments:
-            upload_service = UploadService()
+
+        async def _release_reservation():
             try:
-                for attach_type, attach_data in attachments:
-                    if attach_type == "image":
-                        # 上传图片
-                        _, file_uri = await upload_service.upload(attach_data, token)
-                        image_url = f"https://assets.grok.com/{file_uri}"
-                        logger.info(f"Image uploaded for video: {image_url}")
-                        break  # 视频模型只使用第一张图片
-            finally:
-                await upload_service.close()
-        
-        # 生成视频
-        service = VideoService()
-        
-        try:
-            # 图片转视频
-            if image_url:
-                response = await service.generate_from_image(
-                    token, prompt, image_url,
-                    aspect_ratio, video_length, resolution, stream, preset
-                )
-            else:
-                response = await service.generate(
-                    token, prompt,
-                    aspect_ratio, video_length, resolution, stream, preset
-                )
-        except Exception:
-            try:
-                await request_stats.record_request(model, success=False)
+                await token_mgr.release_token_reservation(token, reservation_id)
             except Exception:
                 pass
-            raise
         
-        # 处理响应
-        if is_stream:
-            processor = VideoStreamProcessor(model, token, think).process(response)
-
-            async def _wrapped_stream():
-                completed = False
-                try:
-                    async for chunk in processor:
-                        yield chunk
-                    completed = True
-                finally:
-                    try:
-                        if completed:
-                            await token_mgr.sync_usage(token, model, consume_on_fail=True, is_usage=True)
-                            await request_stats.record_request(model, success=True)
-                        else:
-                            await request_stats.record_request(model, success=False)
-                    except Exception:
-                        pass
-
-            return _wrapped_stream()
-
-        result = await VideoCollectProcessor(model, token).process(response)
+        release_in_outer = True
         try:
-            await token_mgr.sync_usage(token, model, consume_on_fail=True, is_usage=True)
-            await request_stats.record_request(model, success=True)
-        except Exception:
-            pass
-        return result
+            # 解析参数
+            think = None
+            if thinking == "enabled":
+                think = True
+            elif thinking == "disabled":
+                think = False
+
+            is_stream = stream if stream is not None else get_config("grok.stream", True)
+
+            # 提取内容
+            from app.services.grok.chat import MessageExtractor
+            from app.services.grok.assets import UploadService
+
+            try:
+                prompt, attachments = MessageExtractor.extract(messages, is_video=True)
+            except ValueError as e:
+                raise ValidationException(str(e))
+
+            # 处理图片附件
+            image_url = None
+            if attachments:
+                upload_service = UploadService()
+                try:
+                    for attach_type, attach_data in attachments:
+                        if attach_type == "image":
+                            # 上传图片
+                            _, file_uri = await upload_service.upload(attach_data, token)
+                            image_url = f"https://assets.grok.com/{file_uri}"
+                            logger.info(f"Image uploaded for video: {image_url}")
+                            break  # 视频模型只使用第一张图片
+                finally:
+                    await upload_service.close()
+
+            # 生成视频
+            service = VideoService()
+
+            try:
+                # 图片转视频
+                if image_url:
+                    response = await service.generate_from_image(
+                        token, prompt, image_url,
+                        aspect_ratio, video_length, resolution, stream, preset
+                    )
+                else:
+                    response = await service.generate(
+                        token, prompt,
+                        aspect_ratio, video_length, resolution, stream, preset
+                    )
+            except Exception:
+                try:
+                    await request_stats.record_request(model, success=False)
+                except Exception:
+                    pass
+                raise
+
+            # 处理响应
+            if is_stream:
+                processor = VideoStreamProcessor(model, token, think).process(response)
+
+                async def _wrapped_stream():
+                    completed = False
+                    try:
+                        async for chunk in processor:
+                            yield chunk
+                        completed = True
+                    finally:
+                        try:
+                            if completed:
+                                await token_mgr.sync_usage(token, model, consume_on_fail=True, is_usage=True)
+                                await request_stats.record_request(model, success=True)
+                            else:
+                                await request_stats.record_request(model, success=False)
+                        except Exception:
+                            pass
+                        finally:
+                            await _release_reservation()
+
+                release_in_outer = False
+                return _wrapped_stream()
+
+            result = await VideoCollectProcessor(model, token).process(response)
+            try:
+                await token_mgr.sync_usage(token, model, consume_on_fail=True, is_usage=True)
+                await request_stats.record_request(model, success=True)
+            except Exception:
+                pass
+            return result
+        finally:
+            if release_in_outer:
+                await _release_reservation()
 
 
 __all__ = ["VideoService"]

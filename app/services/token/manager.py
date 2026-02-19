@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+import uuid
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -190,6 +191,96 @@ class TokenManager:
             if token:
                 return token, raw_token
         return None, raw_token
+
+    @staticmethod
+    def _now_ms() -> int:
+        return int(time.time() * 1000)
+
+    def _reserve_ttl_ms(self) -> int:
+        value = get_config("token.reserve_ttl_ms", 180000)
+        try:
+            value = int(value)
+        except Exception:
+            value = 180000
+        return max(1000, value)
+
+    async def reserve_token_for_model(
+        self,
+        model_id: str,
+        exclude: Optional[set] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """
+        为请求预占一个 Token（跨 worker 原子）。
+
+        返回:
+            (token, request_id)；若无可用 token，返回 (None, None)
+        """
+        storage = get_storage()
+        now_ms = self._now_ms()
+        ttl_ms = self._reserve_ttl_ms()
+        request_id = uuid.uuid4().hex
+        excluded = set(exclude or set())
+
+        async with storage.acquire_lock("token_select", timeout=10):
+            await self.reload()
+
+            from app.services.grok.model import ModelService
+
+            bucket = "heavy" if ModelService.is_heavy_bucket_model(model_id) else "normal"
+            for pool_name in ModelService.pool_candidates_for_model(model_id):
+                pool = self.pools.get(pool_name)
+                if not pool:
+                    continue
+
+                token_info = pool.select(bucket=bucket, exclude=excluded, now_ms=now_ms)
+                if not token_info:
+                    continue
+
+                token_info.inflight_until = now_ms + ttl_ms
+                token_info.inflight_request_id = request_id
+                await self._save()
+                token = token_info.token
+                return token[4:] if token.startswith("sso=") else token, request_id
+
+        return None, None
+
+    async def release_token_reservation(
+        self,
+        token_str: str,
+        request_id: Optional[str],
+    ) -> bool:
+        """释放预占；request_id 不匹配时不释放，避免误释放其他请求。"""
+        if not request_id:
+            return False
+
+        storage = get_storage()
+        raw_token = self._normalize_input_token(token_str)
+        if not raw_token:
+            return False
+
+        async with storage.acquire_lock("token_select", timeout=10):
+            await self.reload()
+            token, _ = self._find_token_info(raw_token)
+            if not token:
+                return False
+
+            now_ms = self._now_ms()
+            current_until = int(getattr(token, "inflight_until", 0) or 0)
+            current_request_id = getattr(token, "inflight_request_id", None)
+
+            if current_until <= now_ms:
+                token.inflight_until = 0
+                token.inflight_request_id = None
+                await self._save()
+                return True
+
+            if current_request_id != request_id:
+                return False
+
+            token.inflight_until = 0
+            token.inflight_request_id = None
+            await self._save()
+            return True
 
     def get_token(self, pool_name: str = "ssoBasic") -> Optional[str]:
         """

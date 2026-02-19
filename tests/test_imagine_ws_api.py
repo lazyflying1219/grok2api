@@ -85,11 +85,11 @@ def test_imagine_ws_start_stop_message_flow(monkeypatch: pytest.MonkeyPatch):
         def __init__(self):
             self.sync_calls = 0
 
-        async def reload_if_stale(self):
-            return None
+        async def reserve_token_for_model(self, _model_id: str, exclude=None):
+            return "token-demo", "req-imagine-1"
 
-        def get_token_for_model(self, _model_id: str):
-            return "token-demo"
+        async def release_token_reservation(self, _token: str, _request_id: str):
+            return True
 
         async def sync_usage(self, *_args, **_kwargs):
             self.sync_calls += 1
@@ -143,11 +143,11 @@ def test_imagine_ws_stop_immediately_remains_healthy(monkeypatch: pytest.MonkeyP
     client = _build_client(monkeypatch, api_key="valid-key")
 
     class _DummyTokenManager:
-        async def reload_if_stale(self):
-            return None
+        async def reserve_token_for_model(self, _model_id: str, exclude=None):
+            return "token-demo", "req-imagine-2"
 
-        def get_token_for_model(self, _model_id: str):
-            return "token-demo"
+        async def release_token_reservation(self, _token: str, _request_id: str):
+            return True
 
         async def sync_usage(self, *_args, **_kwargs):
             return True

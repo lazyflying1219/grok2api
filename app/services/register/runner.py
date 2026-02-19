@@ -123,6 +123,54 @@ class RegisterRunner:
     def accounts(self) -> List[Dict[str, str]]:
         return list(self._accounts)
 
+    @staticmethod
+    def _compact_preview(text: str, limit: int = 200) -> str:
+        compact = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(compact) > limit:
+            return compact[:limit] + "..."
+        return compact
+
+    @classmethod
+    def _extract_set_cookie_url(cls, text: str, headers: Optional[Dict[str, str]] = None) -> Optional[str]:
+        def _normalize(candidate: str) -> str:
+            s = str(candidate or "").strip()
+            if not s:
+                return ""
+            s = s.replace("\\/", "/")
+            s = s.strip("\"'")
+            s = s.rstrip(",:;)]}")
+            return s
+
+        if headers:
+            lower_headers = {str(k).lower(): str(v) for k, v in headers.items() if v is not None}
+            for key in ("x-action-redirect", "x-nextjs-redirect", "location"):
+                value = lower_headers.get(key)
+                if not value:
+                    continue
+                header_url = cls._extract_set_cookie_url(value, headers=None)
+                if header_url:
+                    return header_url
+
+        body = _normalize(text)
+        if not body:
+            return None
+
+        patterns = (
+            r'https?://[^\s"\'<>\\]+set-cookie\?q=[^\s"\'<>\\]+',
+            r'/[^\s"\'<>\\]*set-cookie\?q=[^\s"\'<>\\]+',
+        )
+        for pattern in patterns:
+            match = re.search(pattern, body)
+            if not match:
+                continue
+            url = _normalize(match.group(0))
+            if not url:
+                continue
+            if url.startswith("/"):
+                return urljoin(SITE_URL, url)
+            return url
+        return None
+
     def _record_success(self, email: str, password: str, token: str) -> None:
         with self._result_lock:
             if self._success_count >= self.target_count:
@@ -154,6 +202,7 @@ class RegisterRunner:
                 self.stop_event.set()
 
     def _record_error(self, message: str) -> None:
+        logger.warning("Register error: {}", message)
         if self.on_error:
             try:
                 self.on_error(message)
@@ -204,6 +253,11 @@ class RegisterRunner:
         }
         try:
             res = session.post(url, data=data, headers=headers, timeout=15)
+            logger.debug(
+                "Register: send_email_code status={} body_hex={}",
+                res.status_code,
+                res.content[:100].hex(),
+            )
             return res.status_code == 200
         except Exception as exc:
             self._record_error(f"send code error: {email} - {exc}")
@@ -221,6 +275,11 @@ class RegisterRunner:
         }
         try:
             res = session.post(url, data=data, headers=headers, timeout=15)
+            logger.debug(
+                "Register: verify_email_code status={} body_hex={}",
+                res.status_code,
+                res.content[:100].hex(),
+            )
             return res.status_code == 200
         except Exception as exc:
             self._record_error(f"verify code error: {email} - {exc}")
@@ -316,7 +375,6 @@ class RegisterRunner:
                             "content-type": "text/plain;charset=UTF-8",
                             "origin": SITE_URL,
                             "referer": f"{SITE_URL}/sign-up",
-                            "cookie": f"__cf_bm={session.cookies.get('__cf_bm','')}",
                             "next-router-state-tree": self._config["state_tree"] or "",
                             "next-action": final_action_id,
                         }
@@ -335,6 +393,18 @@ class RegisterRunner:
                             }
                         ]
 
+                        logger.debug(
+                            "Register: sign_up payload keys={} email={} code={}",
+                            list(payload[0].keys()),
+                            email,
+                            verify_code,
+                        )
+
+                        logger.debug(
+                            "Register: sign_up cookies before POST: {}",
+                            {k: v[:12] + "..." if len(v) > 12 else v for k, v in session.cookies.items()},
+                        )
+
                         with self._post_lock:
                             res = session.post(
                                 f"{SITE_URL}/sign-up",
@@ -348,18 +418,31 @@ class RegisterRunner:
                             time.sleep(3)
                             continue
 
-                        match = re.search(r'(https://[^" \s]+set-cookie\?q=[^:" \s]+)1:', res.text)
-                        if not match:
-                            self._record_error("sign_up missing set-cookie redirect")
-                            break
+                        # Detect gRPC-style errors in RSC response body
+                        rsc_error = re.search(r'"error"\s*:\s*"(\d+ [^"]+)"', res.text)
+                        if rsc_error:
+                            resp_headers = {k.lower(): v for k, v in res.headers.items()}
+                            logger.warning(
+                                "Register: sign_up RSC error: {} | resp_headers={}",
+                                rsc_error.group(1),
+                                {k: v for k, v in resp_headers.items() if k.startswith("x-")},
+                            )
 
-                        verify_url = match.group(1)
-                        session.get(verify_url, allow_redirects=True, timeout=15)
+                        verify_url = self._extract_set_cookie_url(res.text, headers=dict(res.headers))
+                        if verify_url:
+                            try:
+                                session.get(verify_url, allow_redirects=True, timeout=15)
+                            except Exception as exc:
+                                self._record_error(f"sign_up verify redirect failed: {exc}")
+                                break
 
                         sso = session.cookies.get("sso")
                         sso_rw = session.cookies.get("sso-rw")
                         if not sso:
-                            self._record_error("sign_up missing sso cookie")
+                            preview = self._compact_preview(res.text)
+                            self._record_error(
+                                f"sign_up missing sso cookie (redirect_found={bool(verify_url)}) preview={preview}"
+                            )
                             break
 
                         tos_result = user_agreement_service.accept_tos_version(

@@ -10,18 +10,24 @@ from app.services.grok import chat as chat_mod
 class _DummyTokenManager:
     def __init__(self):
         self.select_calls = []
+        self.release_calls = []
         self.fail_calls = []
 
     async def reload_if_stale(self):
         return None
 
-    def get_token_for_model(self, model, exclude=None):
+    async def reserve_token_for_model(self, model, exclude=None):
         excluded = tuple(sorted(exclude or set()))
         self.select_calls.append((model, excluded))
+        req_id = f"req-{len(self.select_calls)}"
         for token in ("token-a-long-1234567890", "token-b-long-0987654321"):
             if token not in set(excluded):
-                return token
-        return None
+                return token, req_id
+        return None, None
+
+    async def release_token_reservation(self, token, request_id):
+        self.release_calls.append((token, request_id))
+        return True
 
     async def record_fail(self, token, status, reason):
         self.fail_calls.append((token, status, reason))
@@ -71,6 +77,10 @@ def test_non_200_should_switch_token_even_if_not_in_retry_codes(monkeypatch):
         assert [item[:2] for item in mgr.fail_calls] == [
             ("token-a-long-1234567890", 500),
             ("token-b-long-0987654321", 500),
+        ]
+        assert [item[0] for item in mgr.release_calls] == [
+            "token-a-long-1234567890",
+            "token-b-long-0987654321",
         ]
         assert sleep_calls == [0.5]
         assert any("token-a-long-1234567890" in msg for msg in warning_messages)
