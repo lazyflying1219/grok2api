@@ -5,8 +5,10 @@ API 认证模块
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
+import time
 from pathlib import Path
 from typing import Optional, Set
 
@@ -26,6 +28,83 @@ LEGACY_API_KEYS_FILE = Path(__file__).parent.parent.parent / "data" / "api_keys.
 _legacy_api_keys_cache: Set[str] | None = None
 _legacy_api_keys_mtime: float | None = None
 _legacy_api_keys_lock = asyncio.Lock()
+
+
+# ============= Session Token =============
+# Stateless HMAC-SHA256 session tokens so the admin login endpoint
+# never returns the raw app_key / admin password.
+#
+# Format:  hex(timestamp_seconds) + "." + hex(hmac_sha256(app_key, timestamp_hex))
+# Verify:  re-derive the HMAC and check timestamp < SESSION_TTL_SEC.
+
+SESSION_TTL_SEC = 7 * 24 * 3600  # 7 days
+
+
+def create_session_token(app_key: str) -> str:
+    """Sign a stateless session token derived from app_key."""
+    ts_hex = format(int(time.time()), "x")
+    sig = hmac.new(
+        app_key.encode(), ts_hex.encode(), hashlib.sha256
+    ).hexdigest()
+    return f"{ts_hex}.{sig}"
+
+
+def verify_session_token(token: str, app_key: str) -> bool:
+    """Verify a session token against the current app_key."""
+    parts = token.split(".", 1)
+    if len(parts) != 2:
+        return False
+    ts_hex, sig = parts
+    try:
+        ts = int(ts_hex, 16)
+    except ValueError:
+        return False
+    # Check expiry
+    if time.time() - ts > SESSION_TTL_SEC:
+        return False
+    expected = hmac.new(
+        app_key.encode(), ts_hex.encode(), hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(sig, expected)
+
+
+# ============= Login Rate Limiter =============
+# Simple in-memory sliding-window rate limiter for the login endpoint.
+# Tracks failed attempts per IP; blocks after MAX_FAILURES within WINDOW_SEC.
+
+_LOGIN_MAX_FAILURES = 10
+_LOGIN_WINDOW_SEC = 300  # 5 min
+_login_failures: dict[str, list[float]] = {}
+_login_lock = asyncio.Lock()
+
+
+async def check_login_rate_limit(ip: str) -> None:
+    """Raise 429 if the IP has exceeded login failure threshold."""
+    async with _login_lock:
+        now = time.time()
+        cutoff = now - _LOGIN_WINDOW_SEC
+        attempts = _login_failures.get(ip)
+        if attempts:
+            # Trim old entries
+            attempts[:] = [t for t in attempts if t > cutoff]
+            if len(attempts) >= _LOGIN_MAX_FAILURES:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Too many login attempts. Please try again later.",
+                )
+
+
+async def record_login_failure(ip: str) -> None:
+    """Record a failed login attempt for rate limiting."""
+    async with _login_lock:
+        now = time.time()
+        if ip not in _login_failures:
+            _login_failures[ip] = []
+        _login_failures[ip].append(now)
+        # Cap list size to avoid unbounded growth
+        if len(_login_failures[ip]) > _LOGIN_MAX_FAILURES * 2:
+            cutoff = now - _LOGIN_WINDOW_SEC
+            _login_failures[ip] = [t for t in _login_failures[ip] if t > cutoff]
 
 
 async def _load_legacy_api_keys() -> Set[str]:
@@ -130,7 +209,9 @@ async def verify_app_key(
     """
     验证后台登录密钥（app_key）。
 
-    如果未配置 app_key，则跳过验证。
+    接受两种凭证:
+    - 原始 app_key（适用于 API 自动化/脚本）
+    - HMAC session token（由 /api/v1/admin/login 签发，不暴露原始密码）
     """
     app_key = str(get_config("app.app_key", "") or "").strip()
 
@@ -148,15 +229,24 @@ async def verify_app_key(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    if not hmac.compare_digest(auth.credentials, app_key):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+    cred = auth.credentials
+    # Accept raw app_key (for API automation) or a valid session token
+    if hmac.compare_digest(cred, app_key) or verify_session_token(cred, app_key):
+        return cred
 
-    return auth.credentials
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid authentication token",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
-__all__ = ["verify_api_key", "verify_app_key"]
+__all__ = [
+    "verify_api_key",
+    "verify_app_key",
+    "create_session_token",
+    "verify_session_token",
+    "check_login_rate_limit",
+    "record_login_failure",
+]
 

@@ -114,10 +114,14 @@ def create_app() -> FastAPI:
         return {"status": "healthy", "service": "Grok2API", "runtime": "python-fastapi"}
 
     # CORS 配置
+    # NOTE: allow_credentials=True + allow_origins=["*"] violates the CORS spec
+    # and causes browsers to echo any requesting Origin — effectively allowing
+    # every site to call the API with cookies/credentials.
+    # Admin UI is same-origin; API clients use Authorization header, not cookies.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )

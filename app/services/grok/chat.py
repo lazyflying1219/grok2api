@@ -3,7 +3,6 @@ Grok Chat 服务
 """
 
 import asyncio
-import uuid
 import orjson
 import tiktoken
 from typing import Dict, List, Any
@@ -14,12 +13,12 @@ from curl_cffi.requests import AsyncSession
 from app.core.logger import logger
 from app.core.config import get_config
 from app.core.exceptions import (
-    AppException, 
+    AppException,
     UpstreamException,
     ValidationException,
     ErrorType
 )
-from app.services.grok.statsig import StatsigService
+from app.services.grok.headers import build_grok_headers
 from app.services.grok.model import ModelService
 from app.services.grok.assets import UploadService
 from app.services.grok.processor import StreamProcessor, CollectProcessor
@@ -176,39 +175,7 @@ class ChatRequestBuilder:
     @staticmethod
     def build_headers(token: str) -> Dict[str, str]:
         """构造请求头"""
-        headers = {
-            "Accept": "*/*",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Accept-Language": "zh-CN,zh;q=0.9",
-            "Baggage": "sentry-environment=production,sentry-release=d6add6fb0460641fd482d767a335ef72b9b6abb8,sentry-public_key=b311e0f2690c81f25e2c4cf6d4f7ce1c",
-            "Cache-Control": "no-cache",
-            "Content-Type": "application/json",
-            "Origin": "https://grok.com",
-            "Pragma": "no-cache",
-            "Priority": "u=1, i",
-            "Referer": "https://grok.com/",
-            "Sec-Ch-Ua": '"Google Chrome";v="136", "Chromium";v="136", "Not(A:Brand";v="24"',
-            "Sec-Ch-Ua-Arch": "arm",
-            "Sec-Ch-Ua-Bitness": "64",
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Model": "",
-            "Sec-Ch-Ua-Platform": '"macOS"',
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-        }
-        
-        # Statsig ID
-        headers["x-statsig-id"] = StatsigService.gen_id()
-        headers["x-xai-request-id"] = str(uuid.uuid4())
-        
-        # Cookie
-        token = token[4:] if token.startswith("sso=") else token
-        cf = get_config("grok.cf_clearance", "")
-        headers["Cookie"] = f"sso={token};cf_clearance={cf}" if cf else f"sso={token}"
-        
-        return headers
+        return build_grok_headers(token)
     
     @staticmethod
     def build_payload(

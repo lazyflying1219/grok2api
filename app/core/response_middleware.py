@@ -31,6 +31,10 @@ class ResponseLoggerMiddleware(BaseHTTPMiddleware):
     _banned_ips_loaded: bool = False
     _banned_ips_file_mtime: float | None = None
 
+    # Cache for trusted proxy rules
+    _proxy_rules_raw = None
+    _proxy_rules_cache: tuple[set[str], list[ipaddress._BaseNetwork]] | None = None
+
     @staticmethod
     def _file_persistence_enabled() -> bool:
         """
@@ -55,9 +59,13 @@ class ResponseLoggerMiddleware(BaseHTTPMiddleware):
     def _trust_proxy_headers() -> bool:
         return bool(get_config("security.trust_proxy_headers", True))
 
-    @staticmethod
-    def _trusted_proxy_rules() -> tuple[set[str], list[ipaddress._BaseNetwork]]:
+    @classmethod
+    def _trusted_proxy_rules(cls) -> tuple[set[str], list[ipaddress._BaseNetwork]]:
         raw = get_config("security.trusted_proxy_ips", ["127.0.0.1", "::1"])
+        # Return cached result if config hasn't changed
+        if cls._proxy_rules_cache is not None and cls._proxy_rules_raw == raw:
+            return cls._proxy_rules_cache
+
         if isinstance(raw, str):
             items = [p.strip() for p in raw.split(",")]
         elif isinstance(raw, (list, tuple, set)):
@@ -79,13 +87,15 @@ class ResponseLoggerMiddleware(BaseHTTPMiddleware):
                 except ValueError:
                     pass
 
-            ip = ResponseLoggerMiddleware._parse_ip(item)
+            ip = cls._parse_ip(item)
             if ip:
                 exact.add(ip)
             else:
                 # Keep non-IP tokens as-is for tests or custom environments.
                 exact.add(item)
 
+        cls._proxy_rules_raw = raw
+        cls._proxy_rules_cache = (exact, nets)
         return exact, nets
 
     @classmethod

@@ -220,7 +220,6 @@ class Config:
     """配置管理器"""
 
     _instance = None
-    _config = {}
 
     def __init__(self):
         self._config = {}

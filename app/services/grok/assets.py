@@ -31,6 +31,7 @@ from app.core.exceptions import (
     ValidationException
 )
 from app.services.grok.statsig import StatsigService
+from app.services.grok.headers import build_grok_headers
 
 
 # ==================== 常量 ====================
@@ -91,7 +92,8 @@ async def _file_lock(name: str, timeout: int = 10):
                 break
             except BlockingIOError:
                 if time.monotonic() - start >= timeout:
-                    break
+                    logger.warning(f"File lock '{name}' timed out after {timeout}s")
+                    raise TimeoutError(f"File lock '{name}' acquisition timed out")
                 await asyncio.sleep(0.05)
         yield
     finally:
@@ -155,39 +157,7 @@ class BaseService:
     
     def _headers(self, token: str, referer: str = "https://grok.com/") -> dict:
         """构建请求头"""
-        headers = {
-            "Accept": "*/*",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Accept-Language": "zh-CN,zh;q=0.9",
-            "Baggage": "sentry-environment=production,sentry-release=d6add6fb0460641fd482d767a335ef72b9b6abb8,sentry-public_key=b311e0f2690c81f25e2c4cf6d4f7ce1c",
-            "Cache-Control": "no-cache",
-            "Content-Type": "application/json",
-            "Origin": "https://grok.com",
-            "Pragma": "no-cache",
-            "Priority": "u=1, i",
-            "Referer": referer,
-            "Sec-Ch-Ua": '"Google Chrome";v="136", "Chromium";v="136", "Not(A:Brand";v="24"',
-            "Sec-Ch-Ua-Arch": "arm",
-            "Sec-Ch-Ua-Bitness": "64",
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Model": "",
-            "Sec-Ch-Ua-Platform": '"macOS"',
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-        }
-        
-        # Statsig ID
-        headers["x-statsig-id"] = StatsigService.gen_id()
-        headers["x-xai-request-id"] = str(uuid.uuid4())
-        
-        # Cookie
-        token = token[4:] if token.startswith("sso=") else token
-        cf = get_config("grok.cf_clearance", "")
-        headers["Cookie"] = f"sso={token};cf_clearance={cf}" if cf else f"sso={token}"
-        
-        return headers
+        return build_grok_headers(token, referer)
     
     def _proxies(self) -> Optional[dict]:
         """构建代理配置"""
@@ -230,7 +200,7 @@ class BaseService:
         try:
             result = urlparse(input_str)
             return all([result.scheme, result.netloc]) and result.scheme in ['http', 'https']
-        except:
+        except Exception:
             return False
 
     @staticmethod
@@ -600,7 +570,7 @@ class DeleteService(BaseService):
                     if asset_id:
                         try:
                             return await self.delete(token, asset_id)
-                        except:
+                        except Exception:
                             return False
                     return False
 
@@ -630,19 +600,25 @@ class DeleteService(BaseService):
 
 class DownloadService(BaseService):
     """文件下载服务"""
-    
+
+    _dirs_ensured: bool = False
+
     def __init__(self, proxy: str = None):
         super().__init__(proxy)
-        # 创建缓存目录
         self.base_dir = Path(__file__).parent.parent.parent.parent / "data" / "tmp"
         self.legacy_base_dir = Path(__file__).parent.parent.parent.parent / "data" / "temp"
         self.legacy_image_dir = self.legacy_base_dir / "image"
         self.legacy_video_dir = self.legacy_base_dir / "video"
         self.image_dir = self.base_dir / "image"
         self.video_dir = self.base_dir / "video"
+        self._cleanup_running = False
+
+    def _ensure_dirs(self):
+        if DownloadService._dirs_ensured:
+            return
         self.image_dir.mkdir(parents=True, exist_ok=True)
         self.video_dir.mkdir(parents=True, exist_ok=True)
-        self._cleanup_running = False
+        DownloadService._dirs_ensured = True
     
     def _cache_path(self, file_path: str, media_type: str) -> Path:
         """获取缓存路径"""
@@ -665,6 +641,7 @@ class DownloadService(BaseService):
         """
         async with _get_assets_semaphore():
             try:
+                self._ensure_dirs()
                 # Be forgiving: callers may pass absolute URLs.
                 if isinstance(file_path, str) and file_path.startswith("http"):
                     try:
@@ -910,7 +887,7 @@ class DownloadService(BaseService):
                                 stat = f.stat()
                                 total_size += stat.st_size
                                 all_files.append((f, stat.st_mtime, stat.st_size))
-                            except:
+                            except Exception:
                                 pass
                 
                 current_mb = total_size / 1024 / 1024

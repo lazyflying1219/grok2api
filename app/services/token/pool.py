@@ -115,10 +115,6 @@ class TokenPool:
             
         return stats
         
-    def _rebuild_index(self):
-        """重建索引（预留接口，用于加载时调用）"""
-        pass
-        
     def __iter__(self) -> Iterator[TokenInfo]:
         return iter(self._tokens.values())
 

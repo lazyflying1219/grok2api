@@ -12,7 +12,6 @@
 import abc
 import os
 import asyncio
-import os
 import hashlib
 import time
 import tomllib
@@ -288,7 +287,7 @@ class RedisStorage(BaseStorage):
                 
                 try:
                     val = json_loads(val_str)
-                except:
+                except (ValueError, TypeError):
                     val = val_str
                 config[section][key] = val
             return config
@@ -353,13 +352,13 @@ class RedisStorage(BaseStorage):
                 # 恢复 tags (JSON -> List)
                 if "tags" in t_data:
                     try: t_data["tags"] = json_loads(t_data["tags"])
-                    except: t_data["tags"] = []
+                    except (ValueError, TypeError): t_data["tags"] = []
                 
                 # 类型转换 (Redis 返回全 string)
                 for int_field in ["quota", "created_at", "use_count", "fail_count", "last_used_at", "last_fail_at", "last_sync_at"]:
                     if t_data.get(int_field) and t_data[int_field] != "None":
                          try: t_data[int_field] = int(t_data[int_field])
-                         except: pass
+                         except (ValueError, TypeError): pass
                          
                 token_lookup[tid] = t_data
 
@@ -597,7 +596,7 @@ class SQLStorage(BaseStorage):
                     if section not in config: config[section] = {}
                     try:
                         val = json_loads(val_str)
-                    except:
+                    except (ValueError, TypeError):
                         val = val_str
                     config[section][key] = val
                 return config
@@ -614,16 +613,19 @@ class SQLStorage(BaseStorage):
                     if not isinstance(items, dict): continue
                     for key, val in items.items():
                         val_str = json_dumps(val)
-                        
-                        # Upsert 逻辑 (简单实现: Delete + Insert)
-                        await session.execute(
-                            text("DELETE FROM app_config WHERE section=:s AND key_name=:k"),
-                            {"s": section, "k": key}
-                        )
-                        await session.execute(
-                            text("INSERT INTO app_config (section, key_name, value) VALUES (:s, :k, :v)"),
-                            {"s": section, "k": key, "v": val_str}
-                        )
+
+                        if self.dialect in ("mysql", "mariadb"):
+                            await session.execute(
+                                text("INSERT INTO app_config (section, key_name, value) VALUES (:s, :k, :v) "
+                                     "ON DUPLICATE KEY UPDATE value=VALUES(value)"),
+                                {"s": section, "k": key, "v": val_str}
+                            )
+                        else:
+                            await session.execute(
+                                text("INSERT INTO app_config (section, key_name, value) VALUES (:s, :k, :v) "
+                                     "ON CONFLICT (section, key_name) DO UPDATE SET value=EXCLUDED.value"),
+                                {"s": section, "k": key, "v": val_str}
+                            )
                 await session.commit()
         except Exception as e:
             logger.error(f"SQLStorage: 保存配置失败: {e}")
@@ -648,7 +650,7 @@ class SQLStorage(BaseStorage):
                         else:
                             t_data = data_json
                         pools[pool_name].append(t_data)
-                    except:
+                    except (ValueError, TypeError):
                         pass
                 return pools
         except Exception as e:
@@ -660,24 +662,51 @@ class SQLStorage(BaseStorage):
         from sqlalchemy import text
         try:
             async with self.async_session() as session:
-                await session.execute(text("DELETE FROM tokens")) 
-                
+                all_token_keys = set()
                 params = []
                 for pool_name, tokens in data.items():
                     for t in tokens:
+                        token_key = t.get("token")
+                        if not token_key:
+                            continue
+                        all_token_keys.add(token_key)
                         params.append({
-                            "token": t.get("token"),
+                            "token": token_key,
                             "pool_name": pool_name,
                             "data": json_dumps(t),
                             "updated_at": 0
                         })
-                
+
+                # UPSERT all tokens
                 if params:
-                    # 批量插入
+                    if self.dialect in ("mysql", "mariadb"):
+                        for p in params:
+                            await session.execute(
+                                text("INSERT INTO tokens (token, pool_name, data, updated_at) "
+                                     "VALUES (:token, :pool_name, :data, :updated_at) "
+                                     "ON DUPLICATE KEY UPDATE pool_name=VALUES(pool_name), "
+                                     "data=VALUES(data), updated_at=VALUES(updated_at)"),
+                                p
+                            )
+                    else:
+                        for p in params:
+                            await session.execute(
+                                text("INSERT INTO tokens (token, pool_name, data, updated_at) "
+                                     "VALUES (:token, :pool_name, :data, :updated_at) "
+                                     "ON CONFLICT (token) DO UPDATE SET pool_name=EXCLUDED.pool_name, "
+                                     "data=EXCLUDED.data, updated_at=EXCLUDED.updated_at"),
+                                p
+                            )
+
+                # Delete stale tokens no longer in the dataset
+                res = await session.execute(text("SELECT token FROM tokens"))
+                existing_keys = {row[0] for row in res.fetchall()}
+                stale_keys = existing_keys - all_token_keys
+                for key in stale_keys:
                     await session.execute(
-                        text("INSERT INTO tokens (token, pool_name, data, updated_at) VALUES (:token, :pool_name, :data, :updated_at)"),
-                        params
+                        text("DELETE FROM tokens WHERE token=:t"), {"t": key}
                     )
+
                 await session.commit()
         except Exception as e:
             logger.error(f"SQLStorage: 保存 Token 失败: {e}")

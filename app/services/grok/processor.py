@@ -47,6 +47,16 @@ def _build_video_poster_preview(video_url: str, thumbnail_url: str = "") -> str:
 </a>'''
 
 
+def _build_video_html(video_url: str, thumbnail_url: str = "") -> str:
+    """构建视频 HTML 标签"""
+    if get_config("grok.video_poster_preview", False):
+        return _build_video_poster_preview(video_url, thumbnail_url)
+    poster_attr = f' poster="{thumbnail_url}"' if thumbnail_url else ""
+    return f'''<video id="video" controls="" preload="none"{poster_attr}>
+  <source id="mp4" src="{video_url}" type="video/mp4">
+</video>'''
+
+
 class BaseProcessor:
     """基础处理器"""
     
@@ -328,13 +338,8 @@ class VideoStreamProcessor(BaseProcessor):
     
     def _build_video_html(self, video_url: str, thumbnail_url: str = "") -> str:
         """构建视频 HTML 标签"""
-        if get_config("grok.video_poster_preview", False):
-            return _build_video_poster_preview(video_url, thumbnail_url)
-        poster_attr = f' poster="{thumbnail_url}"' if thumbnail_url else ""
-        return f'''<video id="video" controls="" preload="none"{poster_attr}>
-  <source id="mp4" src="{video_url}" type="video/mp4">
-</video>'''
-    
+        return _build_video_html(video_url, thumbnail_url)
+
     async def process(self, response: AsyncIterable[bytes]) -> AsyncGenerator[str, None]:
         """处理视频流式响应"""
         def _emit(content: str) -> str:
@@ -402,13 +407,8 @@ class VideoCollectProcessor(BaseProcessor):
         self.video_format = get_config("app.video_format", "url")
     
     def _build_video_html(self, video_url: str, thumbnail_url: str = "") -> str:
-        if get_config("grok.video_poster_preview", False):
-            return _build_video_poster_preview(video_url, thumbnail_url)
-        poster_attr = f' poster="{thumbnail_url}"' if thumbnail_url else ""
-        return f'''<video id="video" controls="" preload="none"{poster_attr}>
-  <source id="mp4" src="{video_url}" type="video/mp4">
-</video>'''
-    
+        return _build_video_html(video_url, thumbnail_url)
+
     async def process(self, response: AsyncIterable[bytes]) -> dict[str, Any]:
         """处理并收集视频响应"""
         content = ""

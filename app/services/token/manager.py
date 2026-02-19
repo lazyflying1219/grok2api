@@ -80,7 +80,6 @@ class TokenManager:
                         except Exception as e:
                             logger.warning(f"Failed to load token in pool '{pool_name}': {e}")
                             continue
-                    pool._rebuild_index()
                     self.pools[pool_name] = pool
                     
                 self.initialized = True

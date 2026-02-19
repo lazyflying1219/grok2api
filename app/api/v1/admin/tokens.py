@@ -1,0 +1,365 @@
+"""
+Admin Token 管理路由
+"""
+
+import asyncio
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException
+
+from app.core.auth import verify_app_key
+from app.core.config import get_config
+from app.core.logger import logger
+from app.core.storage import get_storage
+from app.services.register import get_auto_register_manager
+from app.services.register.account_settings_refresh import (
+    refresh_account_settings_for_tokens,
+    normalize_sso_token as normalize_refresh_token,
+)
+from app.services.token import get_token_manager
+from app.api.v1.admin.common import _safe_int
+
+router = APIRouter()
+
+
+def _pool_to_token_type(pool_name: str) -> str:
+    return "ssoSuper" if str(pool_name or "").strip() == "ssoSuper" else "sso"
+
+
+def _parse_quota_value(v: Any) -> tuple[int, bool]:
+    if v is None or v == "":
+        return -1, False
+    try:
+        n = int(v)
+    except Exception:
+        return -1, False
+    if n < 0:
+        return -1, False
+    return n, True
+
+
+def _normalize_token_status(raw_status: Any) -> str:
+    s = str(raw_status or "active").strip().lower()
+    if s in ("expired", "invalid"):
+        return "expired"
+    if s in ("active", "cooling", "disabled"):
+        return s
+    return "active"
+
+
+def _normalize_admin_token_item(pool_name: str, item: Any) -> dict | None:
+    token_type = _pool_to_token_type(pool_name)
+
+    if isinstance(item, str):
+        token = item.strip()
+        if not token:
+            return None
+        if token.startswith("sso="):
+            token = token[4:]
+        return {
+            "token": token,
+            "status": "active",
+            "quota": 0,
+            "quota_known": False,
+            "heavy_quota": -1,
+            "heavy_quota_known": False,
+            "token_type": token_type,
+            "note": "",
+            "fail_count": 0,
+            "use_count": 0,
+        }
+
+    if not isinstance(item, dict):
+        return None
+
+    token = str(item.get("token") or "").strip()
+    if not token:
+        return None
+    if token.startswith("sso="):
+        token = token[4:]
+
+    quota, quota_known = _parse_quota_value(item.get("quota"))
+    heavy_quota, heavy_quota_known = _parse_quota_value(item.get("heavy_quota"))
+
+    return {
+        "token": token,
+        "status": _normalize_token_status(item.get("status")),
+        "quota": quota if quota_known else 0,
+        "quota_known": quota_known,
+        "heavy_quota": heavy_quota,
+        "heavy_quota_known": heavy_quota_known,
+        "token_type": token_type,
+        "note": str(item.get("note") or ""),
+        "fail_count": _safe_int(item.get("fail_count") or 0, 0),
+        "use_count": _safe_int(item.get("use_count") or 0, 0),
+    }
+
+
+def _collect_tokens_from_pool_payload(payload: Any) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+
+    collected: list[str] = []
+    seen: set[str] = set()
+    for raw_items in payload.values():
+        if not isinstance(raw_items, list):
+            continue
+        for item in raw_items:
+            token_raw = item if isinstance(item, str) else (item.get("token") if isinstance(item, dict) else "")
+            token = normalize_refresh_token(str(token_raw or "").strip())
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            collected.append(token)
+    return collected
+
+
+def _resolve_nsfw_refresh_concurrency(override: Any = None) -> int:
+    source = override if override is not None else get_config("token.nsfw_refresh_concurrency", 10)
+    try:
+        value = int(source)
+    except Exception:
+        value = 10
+    return max(1, value)
+
+
+def _resolve_nsfw_refresh_retries(override: Any = None) -> int:
+    source = override if override is not None else get_config("token.nsfw_refresh_retries", 3)
+    try:
+        value = int(source)
+    except Exception:
+        value = 3
+    return max(0, value)
+
+
+def _trigger_account_settings_refresh_background(
+    tokens: list[str],
+    concurrency: int,
+    retries: int,
+) -> None:
+    if not tokens:
+        return
+
+    async def _run() -> None:
+        try:
+            result = await refresh_account_settings_for_tokens(
+                tokens=tokens,
+                concurrency=concurrency,
+                retries=retries,
+            )
+            summary = result.get("summary") or {}
+            logger.info(
+                "Background account-settings refresh finished: total={} success={} failed={} invalidated={}",
+                summary.get("total", 0),
+                summary.get("success", 0),
+                summary.get("failed", 0),
+                summary.get("invalidated", 0),
+            )
+        except Exception as exc:
+            logger.warning("Background account-settings refresh failed: {}", exc)
+
+    asyncio.create_task(_run())
+
+
+# ==================== Routes ====================
+
+
+@router.get("/api/v1/admin/tokens", dependencies=[Depends(verify_app_key)])
+async def get_tokens_api():
+    """获取所有 Token"""
+    storage = get_storage()
+    tokens = await storage.load_tokens()
+    data = tokens if isinstance(tokens, dict) else {}
+    out: dict[str, list[dict]] = {}
+    for pool_name, raw_items in data.items():
+        arr = raw_items if isinstance(raw_items, list) else []
+        normalized: list[dict] = []
+        for item in arr:
+            obj = _normalize_admin_token_item(pool_name, item)
+            if obj:
+                normalized.append(obj)
+        out[str(pool_name)] = normalized
+    return out
+
+
+@router.post("/api/v1/admin/tokens", dependencies=[Depends(verify_app_key)])
+async def update_tokens_api(data: dict):
+    """Update token payload and trigger background account-settings refresh for new tokens."""
+    storage = get_storage()
+    try:
+        mgr = await get_token_manager()
+
+        posted_data = data if isinstance(data, dict) else {}
+        existing_tokens: list[str] = []
+        added_tokens: list[str] = []
+
+        async with storage.acquire_lock("tokens_save", timeout=10):
+            old_data = await storage.load_tokens()
+            existing_tokens = _collect_tokens_from_pool_payload(
+                old_data if isinstance(old_data, dict) else {}
+            )
+
+            await storage.save_tokens(posted_data)
+            await mgr.reload()
+
+            new_tokens = _collect_tokens_from_pool_payload(posted_data)
+            existing_set = set(existing_tokens)
+            added_tokens = [token for token in new_tokens if token not in existing_set]
+
+        concurrency = _resolve_nsfw_refresh_concurrency()
+        retries = _resolve_nsfw_refresh_retries()
+        _trigger_account_settings_refresh_background(
+            tokens=added_tokens,
+            concurrency=concurrency,
+            retries=retries,
+        )
+
+        return {
+            "status": "success",
+            "message": "Token updated",
+            "nsfw_refresh": {
+                "mode": "background",
+                "triggered": len(added_tokens),
+                "concurrency": concurrency,
+                "retries": retries,
+            },
+        }
+    except Exception:
+        logger.exception("Admin API error")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post("/api/v1/admin/tokens/refresh", dependencies=[Depends(verify_app_key)])
+async def refresh_tokens_api(data: dict):
+    """刷新 Token 状态"""
+    try:
+        mgr = await get_token_manager()
+        tokens = []
+        if "token" in data:
+            tokens.append(data["token"])
+        if "tokens" in data and isinstance(data["tokens"], list):
+            tokens.extend(data["tokens"])
+
+        if not tokens:
+             raise HTTPException(status_code=400, detail="No tokens provided")
+
+        unique_tokens = list(set(tokens))
+
+        sem = asyncio.Semaphore(10)
+
+        async def _refresh_one(t):
+            async with sem:
+                return t, await mgr.sync_usage(t, "grok-3", consume_on_fail=False, is_usage=False)
+
+        results_list = await asyncio.gather(*[_refresh_one(t) for t in unique_tokens])
+        results = dict(results_list)
+
+        return {"status": "success", "results": results}
+    except Exception:
+        logger.exception("Admin API error")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post("/api/v1/admin/tokens/nsfw/refresh", dependencies=[Depends(verify_app_key)])
+async def refresh_tokens_nsfw_api(data: dict):
+    """Refresh account settings (TOS + birth date + NSFW) for selected/all tokens."""
+    payload = data if isinstance(data, dict) else {}
+    mgr = await get_token_manager()
+
+    tokens: list[str] = []
+    seen: set[str] = set()
+
+    if bool(payload.get("all")):
+        for pool in mgr.pools.values():
+            for info in pool.list():
+                token = normalize_refresh_token(str(info.token or "").strip())
+                if not token or token in seen:
+                    continue
+                seen.add(token)
+                tokens.append(token)
+    else:
+        candidates: list[str] = []
+        single = payload.get("token")
+        if isinstance(single, str):
+            candidates.append(single)
+        batch = payload.get("tokens")
+        if isinstance(batch, list):
+            candidates.extend([item for item in batch if isinstance(item, str)])
+
+        for raw in candidates:
+            token = normalize_refresh_token(str(raw or "").strip())
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            tokens.append(token)
+
+    if not tokens:
+        raise HTTPException(status_code=400, detail="No tokens provided")
+
+    concurrency = _resolve_nsfw_refresh_concurrency(payload.get("concurrency"))
+    retries = _resolve_nsfw_refresh_retries(payload.get("retries"))
+    result = await refresh_account_settings_for_tokens(
+        tokens=tokens,
+        concurrency=concurrency,
+        retries=retries,
+    )
+    return {
+        "status": "success",
+        "summary": result.get("summary") or {},
+        "failed": result.get("failed") or [],
+    }
+
+
+@router.post("/api/v1/admin/tokens/auto-register", dependencies=[Depends(verify_app_key)])
+async def auto_register_tokens_api(data: dict):
+    """Start auto registration."""
+    try:
+        data = data or {}
+        count = data.get("count")
+        concurrency = data.get("concurrency")
+        pool = (data.get("pool") or "ssoBasic").strip() or "ssoBasic"
+
+        try:
+            count_val = int(count)
+        except Exception:
+            count_val = int(get_config("register.default_count", 100) or 100)
+
+        if count_val <= 0:
+            count_val = int(get_config("register.default_count", 100) or 100)
+
+        try:
+            concurrency_val = int(concurrency)
+        except Exception:
+            concurrency_val = None
+        if concurrency_val is not None and concurrency_val <= 0:
+            concurrency_val = None
+
+        manager = get_auto_register_manager()
+        job = await manager.start_job(count=count_val, pool=pool, concurrency=concurrency_val)
+        return {"status": "started", "job": job.to_dict()}
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception:
+        logger.exception("Admin API error")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/api/v1/admin/tokens/auto-register/status", dependencies=[Depends(verify_app_key)])
+async def auto_register_status_api(job_id: str | None = None):
+    """Get auto registration status."""
+    manager = get_auto_register_manager()
+    status = manager.get_status(job_id)
+    if status.get("status") == "not_found":
+        raise HTTPException(status_code=404, detail="Job not found")
+    return status
+
+
+@router.post("/api/v1/admin/tokens/auto-register/stop", dependencies=[Depends(verify_app_key)])
+async def auto_register_stop_api(job_id: str | None = None):
+    """Stop auto registration (best-effort)."""
+    manager = get_auto_register_manager()
+    status = manager.get_status(job_id)
+    if status.get("status") == "not_found":
+        raise HTTPException(status_code=404, detail="Job not found")
+    await manager.stop_job()
+    return {"status": "stopping"}
