@@ -364,7 +364,8 @@ class TokenManager:
         target_token: TokenInfo,
         bucket: str,
         rate_limit_model: str,
-        is_usage: bool
+        is_usage: bool,
+        retry: bool = True,
     ) -> bool:
         """从上游同步真实额度。"""
         raw_token = self._normalize_input_token(token_str)
@@ -373,7 +374,11 @@ class TokenManager:
             from app.services.grok.usage import UsageService
 
             usage_service = UsageService()
-            result = await usage_service.get(token_str, model_name=rate_limit_model)
+            result = await usage_service.get(
+                token_str,
+                model_name=rate_limit_model,
+                retry=retry,
+            )
 
             if not (result and "remainingTokens" in result):
                 return False
@@ -411,7 +416,8 @@ class TokenManager:
         model_id: str, 
         fallback_effort: EffortType = EffortType.LOW,
         consume_on_fail: bool = True,
-        is_usage: bool = True
+        is_usage: bool = True,
+        retry: bool = True,
     ) -> bool:
         """
         同步 Token 用量
@@ -424,6 +430,7 @@ class TokenManager:
             fallback_effort: 降级时的消耗力度
             consume_on_fail: 失败时是否降级扣费
             is_usage: 是否记录为一次使用（影响 use_count）
+            retry: 远端同步失败时是否按配置重试
             
         Returns:
             是否成功
@@ -459,6 +466,7 @@ class TokenManager:
                     bucket=bucket,
                     rate_limit_model=rate_limit_model,
                     is_usage=False,  # 已本地计次，远端同步只纠偏额度
+                    retry=retry,
                 )
             )
             self._track_usage_sync_task(task)
@@ -471,6 +479,7 @@ class TokenManager:
             bucket=bucket,
             rate_limit_model=rate_limit_model,
             is_usage=is_usage,
+            retry=retry,
         )
         if synced:
             return True

@@ -58,3 +58,37 @@ def test_usage_sync_skips_remote_during_cooldown(monkeypatch):
         assert result == {}
 
     asyncio.run(_run())
+
+
+def test_usage_get_retry_disabled_does_not_retry(monkeypatch):
+    async def _run():
+        monkeypatch.setattr(usage_mod, "_USAGE_SYNC_COOLDOWN_UNTIL", 0.0)
+
+        calls = {"count": 0}
+
+        class _Resp:
+            status_code = 401
+
+            def json(self):
+                return {}
+
+        class _Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, *args, **kwargs):
+                calls["count"] += 1
+                return _Resp()
+
+        monkeypatch.setattr(usage_mod, "AsyncSession", _Session)
+
+        svc = usage_mod.UsageService()
+        with pytest.raises(UpstreamException):
+            await svc.get("tok-demo", "grok-3", retry=False)
+
+        assert calls["count"] == 1
+
+    asyncio.run(_run())

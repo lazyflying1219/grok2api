@@ -89,13 +89,19 @@ class UsageService:
         """构建代理配置"""
         return {"http": self.proxy, "https": self.proxy} if self.proxy else None
     
-    async def get(self, token: str, model_name: str = "grok-4-1-thinking-1129") -> Dict:
+    async def get(
+        self,
+        token: str,
+        model_name: str = "grok-4-1-thinking-1129",
+        retry: bool = True,
+    ) -> Dict:
         """
         获取速率限制信息
         
         Args:
             token: 认证 Token
             model_name: 模型名称
+            retry: 是否启用重试
             
         Returns:
             响应数据
@@ -160,17 +166,14 @@ class UsageService:
                         details={"error": str(e)}
                     )
             
+            if not retry:
+                return await do_request()
+
             # 带重试的执行
-            try:
-                result = await retry_on_status(
-                    do_request,
-                    extract_status=extract_status
-                )
-                return result
-                
-            except Exception as e:
-                # 最后一次失败已经被记录
-                raise
+            return await retry_on_status(
+                do_request,
+                extract_status=extract_status
+            )
 
 
 __all__ = ["UsageService"]

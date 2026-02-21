@@ -20,7 +20,7 @@ def test_sync_usage_consumes_locally_before_remote_sync(monkeypatch):
         gate = asyncio.Event()
 
         class _FakeUsageService:
-            async def get(self, _token: str, model_name: str = "grok-3"):
+            async def get(self, _token: str, model_name: str = "grok-3", retry: bool = True):
                 await gate.wait()
                 return {"remainingTokens": 7}
 
