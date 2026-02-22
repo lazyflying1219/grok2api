@@ -216,7 +216,7 @@ class TokenManager:
         excluded = set(exclude or set())
 
         async with storage.acquire_lock("token_select", timeout=10):
-            await self.reload()
+            await self.reload_if_stale()
 
             from app.services.grok.model import ModelService
 
@@ -232,7 +232,7 @@ class TokenManager:
 
                 token_info.inflight_until = now_ms + ttl_ms
                 token_info.inflight_request_id = request_id
-                await self._save()
+                self._schedule_save()
                 token = token_info.token
                 return token[4:] if token.startswith("sso=") else token, request_id
 
@@ -253,7 +253,7 @@ class TokenManager:
             return False
 
         async with storage.acquire_lock("token_select", timeout=10):
-            await self.reload()
+            await self.reload_if_stale()
             token, _ = self._find_token_info(raw_token)
             if not token:
                 return False
@@ -265,7 +265,7 @@ class TokenManager:
             if current_until <= now_ms:
                 token.inflight_until = 0
                 token.inflight_request_id = None
-                await self._save()
+                self._schedule_save()
                 return True
 
             if current_request_id != request_id:
@@ -273,7 +273,7 @@ class TokenManager:
 
             token.inflight_until = 0
             token.inflight_request_id = None
-            await self._save()
+            self._schedule_save()
             return True
 
     def get_token(self, pool_name: str = "ssoBasic") -> Optional[str]:

@@ -70,6 +70,13 @@ class BaseProcessor:
         self.fingerprint: str = ""
         self.app_url = get_config("app.app_url", "")
         self._dl_service: Optional[DownloadService] = None
+        # Pre-built chunk template (invariant fields) for _sse()
+        self._chunk_template = {
+            "id": self.response_id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+        }
 
     def _get_dl(self) -> DownloadService:
         """获取下载服务实例（复用）"""
@@ -116,15 +123,10 @@ class BaseProcessor:
         elif role:
             # 兼容常见 OpenAI SDK：role 首包通常带一个空 content。
             delta["content"] = ""
-        
-        chunk = {
-            "id": self.response_id,
-            "object": "chat.completion.chunk",
-            "created": self.created,
-            "model": self.model,
-            "system_fingerprint": self.fingerprint,
-            "choices": [{"index": 0, "delta": delta, "logprobs": None, "finish_reason": finish}]
-        }
+
+        chunk = self._chunk_template.copy()
+        chunk["system_fingerprint"] = self.fingerprint
+        chunk["choices"] = [{"index": 0, "delta": delta, "logprobs": None, "finish_reason": finish}]
         return f"data: {orjson.dumps(chunk).decode()}\n\n"
 
 
@@ -139,6 +141,7 @@ class StreamProcessor(BaseProcessor):
         self.image_format = get_config("app.image_format", "url")
         self.prompt_tokens = prompt_tokens
         self._completion_tokens = 0
+        self._raw_completion_text = ""
 
         if think is None:
             self.show_think = get_config("grok.thinking", False)
@@ -213,12 +216,14 @@ class StreamProcessor(BaseProcessor):
                 # 普通 token
                 if (token := resp.get("token")) is not None:
                     if token and not (self.filter_tags and any(t in token for t in self.filter_tags)):
-                        self._completion_tokens += _count_tokens(token)
+                        self._raw_completion_text += token
                         yield _emit(token)
 
             if self.think_opened:
                 yield _emit("</think>\n")
             yield self._sse(finish="stop")
+            # Batch-count completion tokens once (much cheaper than per-token encoding)
+            self._completion_tokens = _count_tokens(self._raw_completion_text)
             # usage chunk (OpenAI spec: separate chunk with choices=[] before [DONE])
             completion_tokens = self._completion_tokens
             total = self.prompt_tokens + completion_tokens

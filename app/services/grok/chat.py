@@ -35,22 +35,28 @@ BROWSER = "chrome136"
 _enc = tiktoken.get_encoding("o200k_base")
 
 
-def _count_prompt_tokens(messages: List[Dict[str, Any]]) -> int:
-    """Count prompt tokens from OpenAI messages using tiktoken (o200k_base)."""
-    total = 3  # base overhead (<|start|>assistant<|message|>)
-    for msg in messages:
-        total += 4  # per-message overhead (role, delimiters)
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            if content:
-                total += len(_enc.encode(content))
-        elif isinstance(content, list):
-            for item in content:
-                if item.get("type") == "text":
-                    text = item.get("text", "")
-                    if text:
-                        total += len(_enc.encode(text))
-    return total
+async def _count_prompt_tokens(messages: List[Dict[str, Any]]) -> int:
+    """Count prompt tokens from OpenAI messages using tiktoken (o200k_base).
+
+    BPE encoding is CPU-intensive, so the actual work runs in a thread pool
+    to avoid blocking the asyncio event loop on large prompts.
+    """
+    def _encode() -> int:
+        total = 3  # base overhead (<|start|>assistant<|message|>)
+        for msg in messages:
+            total += 4  # per-message overhead (role, delimiters)
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                if content:
+                    total += len(_enc.encode(content))
+            elif isinstance(content, list):
+                for item in content:
+                    if item.get("type") == "text":
+                        text = item.get("text", "")
+                        if text:
+                            total += len(_enc.encode(text))
+        return total
+    return await asyncio.to_thread(_encode)
 
 
 @dataclass
@@ -514,7 +520,7 @@ class ChatService:
             raise last_error
         
         # 处理响应
-        prompt_tokens = _count_prompt_tokens(messages)
+        prompt_tokens = await _count_prompt_tokens(messages)
 
         if is_stream:
             processor = StreamProcessor(model_name, token, think, prompt_tokens=prompt_tokens).process(response)
