@@ -155,7 +155,12 @@ class TokenManager:
         finally:
             self._save_task = None
             if self._dirty:
-                self._schedule_save()
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
+                else:
+                    self._schedule_save()
 
     @staticmethod
     def _extract_cookie_value(cookie_str: str, name: str) -> str | None:

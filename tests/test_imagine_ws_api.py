@@ -6,22 +6,19 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from app.api.v1 import admin as admin_api
+from app.api.v1 import admin as admin_pkg
+from app.api.v1.admin import websocket as ws_module
 
 
 def _build_client(monkeypatch: pytest.MonkeyPatch, api_key: str = "test-key") -> TestClient:
-    async def _fake_legacy_keys():
-        return set()
-
-    monkeypatch.setattr(admin_api, "_load_legacy_api_keys", _fake_legacy_keys)
     monkeypatch.setattr(
-        admin_api,
+        ws_module,
         "get_config",
-        lambda key, default=None: api_key if key == "app.api_key" else default,
+        lambda key, default=None: api_key if key == "app.app_key" else default,
     )
 
     app = FastAPI()
-    app.include_router(admin_api.router)
+    app.include_router(admin_pkg.router)
     return TestClient(app)
 
 
@@ -49,20 +46,16 @@ def test_imagine_ws_ping_pong(monkeypatch: pytest.MonkeyPatch):
     assert msg == {"type": "pong"}
 
 
-def test_imagine_ws_accepts_managed_api_key(monkeypatch: pytest.MonkeyPatch):
+def test_imagine_ws_accepts_session_token(monkeypatch: pytest.MonkeyPatch):
     client = _build_client(monkeypatch, api_key="global-key")
 
-    async def _fake_init():
-        return None
-
-    monkeypatch.setattr(admin_api.api_key_manager, "init", _fake_init)
     monkeypatch.setattr(
-        admin_api.api_key_manager,
-        "validate_key",
-        lambda token: {"key": token, "is_active": True} if token == "managed-key" else None,
+        ws_module,
+        "verify_session_token",
+        lambda token, app_key: token == "session-token-abc",
     )
 
-    with client.websocket_connect("/api/v1/admin/imagine/ws?api_key=managed-key") as ws:
+    with client.websocket_connect("/api/v1/admin/imagine/ws?api_key=session-token-abc") as ws:
         ws.send_json({"type": "ping"})
         msg = ws.receive_json()
     assert msg == {"type": "pong"}
@@ -104,13 +97,13 @@ def test_imagine_ws_start_stop_message_flow(monkeypatch: pytest.MonkeyPatch):
         await asyncio.sleep(0.01)
         return ["ZmFrZV9pbWFnZQ=="]
 
-    monkeypatch.setattr(admin_api, "get_token_manager", _fake_get_token_manager)
+    monkeypatch.setattr(ws_module, "get_token_manager", _fake_get_token_manager)
     monkeypatch.setattr(
-        admin_api.ModelService,
+        ws_module.ModelService,
         "get",
         lambda model_id: SimpleNamespace(model_id=model_id, is_image=True),
     )
-    monkeypatch.setattr(admin_api, "_collect_imagine_batch", _fake_collect_imagine_batch)
+    monkeypatch.setattr(ws_module, "_collect_imagine_batch", _fake_collect_imagine_batch)
 
     with client.websocket_connect("/api/v1/admin/imagine/ws?api_key=valid-key") as ws:
         ws.send_json({"type": "start", "prompt": "a cat", "aspect_ratio": "1:1"})
@@ -161,13 +154,13 @@ def test_imagine_ws_stop_immediately_remains_healthy(monkeypatch: pytest.MonkeyP
         await asyncio.sleep(0.5)
         return ["ZmFrZV9pbWFnZQ=="]
 
-    monkeypatch.setattr(admin_api, "get_token_manager", _fake_get_token_manager)
+    monkeypatch.setattr(ws_module, "get_token_manager", _fake_get_token_manager)
     monkeypatch.setattr(
-        admin_api.ModelService,
+        ws_module.ModelService,
         "get",
         lambda model_id: SimpleNamespace(model_id=model_id, is_image=True),
     )
-    monkeypatch.setattr(admin_api, "_collect_imagine_batch", _slow_collect_imagine_batch)
+    monkeypatch.setattr(ws_module, "_collect_imagine_batch", _slow_collect_imagine_batch)
 
     with client.websocket_connect("/api/v1/admin/imagine/ws?api_key=valid-key") as ws:
         ws.send_json({"type": "start", "prompt": "a fox", "aspect_ratio": "1:1"})

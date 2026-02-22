@@ -1,7 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 
-from app.api.v1 import admin as admin_module
+from app.api.v1.admin import tokens as admin_module
 
 
 class _DummyPool:

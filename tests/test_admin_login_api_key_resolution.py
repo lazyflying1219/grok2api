@@ -1,56 +1,48 @@
-import asyncio
-from types import SimpleNamespace
+"""Tests for admin login API.
 
-from app.api.v1 import admin as admin_module
+The login endpoint was refactored: it no longer returns raw API keys
+or performs legacy key resolution. It now validates username/password
+and returns a session token.
+"""
+
+from unittest.mock import AsyncMock
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from app.api.v1.admin import auth as auth_module
+from app.api.v1.admin.auth import router
 
 
-def test_admin_login_prefers_global_api_key(monkeypatch):
-    async def _fake_load_legacy():
-        return {"sk-legacy-a", "sk-legacy-b"}
-
-    def _fake_get_config(path: str, default=None):
-        values = {
-            "app.admin_username": "admin",
-            "app.app_key": "admin",
-            "app.api_key": "sk-global",
-        }
-        return values.get(path, default)
-
-    monkeypatch.setattr(admin_module, "_load_legacy_api_keys", _fake_load_legacy)
-    monkeypatch.setattr(admin_module, "get_config", _fake_get_config)
-
-    result = asyncio.run(
-        admin_module.admin_login_api(
-            SimpleNamespace(headers={}),
-            admin_module.AdminLoginBody(username="admin", password="admin"),
-        )
+def _build_login_client(monkeypatch, username="admin", password="admin"):
+    monkeypatch.setattr(
+        auth_module,
+        "get_config",
+        lambda key, default=None: {
+            "app.admin_username": username,
+            "app.app_key": password,
+        }.get(key, default),
     )
+    monkeypatch.setattr(auth_module, "check_login_rate_limit", AsyncMock())
+    monkeypatch.setattr(auth_module, "record_login_failure", AsyncMock())
 
-    assert result["status"] == "success"
-    assert result["api_key"] == "sk-global"
+    app = FastAPI()
+    app.include_router(router)
+    return TestClient(app)
 
 
-def test_admin_login_falls_back_to_legacy_api_key(monkeypatch):
-    async def _fake_load_legacy():
-        return {"sk-legacy-z", "sk-legacy-a"}
+def test_admin_login_success_returns_session_token(monkeypatch):
+    client = _build_login_client(monkeypatch)
+    resp = client.post("/api/v1/admin/login", json={"username": "admin", "password": "admin"})
 
-    def _fake_get_config(path: str, default=None):
-        values = {
-            "app.admin_username": "admin",
-            "app.app_key": "admin",
-            "app.api_key": "",
-        }
-        return values.get(path, default)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "success"
+    assert data["api_key"]  # session token returned
 
-    monkeypatch.setattr(admin_module, "_load_legacy_api_keys", _fake_load_legacy)
-    monkeypatch.setattr(admin_module, "get_config", _fake_get_config)
 
-    result = asyncio.run(
-        admin_module.admin_login_api(
-            SimpleNamespace(headers={}),
-            admin_module.AdminLoginBody(username="admin", password="admin"),
-        )
-    )
+def test_admin_login_wrong_password_rejected(monkeypatch):
+    client = _build_login_client(monkeypatch, password="secret")
+    resp = client.post("/api/v1/admin/login", json={"username": "admin", "password": "wrong"})
 
-    assert result["status"] == "success"
-    assert result["api_key"] == "sk-legacy-a"
+    assert resp.status_code == 401

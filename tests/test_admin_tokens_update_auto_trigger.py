@@ -1,7 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 
-from app.api.v1 import admin as admin_module
+from app.api.v1.admin import tokens as admin_module
 
 
 class _DummyStorage:
@@ -41,7 +41,7 @@ def test_update_tokens_api_triggers_background_for_new_tokens(monkeypatch):
         captured["retries"] = retries
 
     monkeypatch.setattr(admin_module, "get_storage", lambda: storage)
-    monkeypatch.setattr("app.services.token.manager.get_token_manager", _fake_get_mgr)
+    monkeypatch.setattr(admin_module, "get_token_manager", _fake_get_mgr)
     monkeypatch.setattr(admin_module, "_trigger_account_settings_refresh_background", _fake_trigger)
     monkeypatch.setattr(admin_module, "_resolve_nsfw_refresh_concurrency", lambda override=None: 10)
     monkeypatch.setattr(admin_module, "_resolve_nsfw_refresh_retries", lambda override=None: 3)
@@ -77,7 +77,7 @@ def test_update_tokens_api_does_not_trigger_when_no_new_tokens(monkeypatch):
         captured["retries"] = retries
 
     monkeypatch.setattr(admin_module, "get_storage", lambda: storage)
-    monkeypatch.setattr("app.services.token.manager.get_token_manager", _fake_get_mgr)
+    monkeypatch.setattr(admin_module, "get_token_manager", _fake_get_mgr)
     monkeypatch.setattr(admin_module, "_trigger_account_settings_refresh_background", _fake_trigger)
     monkeypatch.setattr(admin_module, "_resolve_nsfw_refresh_concurrency", lambda override=None: 10)
     monkeypatch.setattr(admin_module, "_resolve_nsfw_refresh_retries", lambda override=None: 3)
