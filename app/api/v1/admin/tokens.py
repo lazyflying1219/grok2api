@@ -11,8 +11,7 @@ from app.core.auth import verify_app_key
 from app.core.config import get_config
 from app.core.logger import logger
 from app.core.storage import get_storage
-from app.services.register import get_auto_register_manager
-from app.services.register.account_settings_refresh import (
+from app.services.token.account_settings import (
     refresh_account_settings_for_tokens,
     normalize_sso_token as normalize_refresh_token,
 )
@@ -316,56 +315,3 @@ async def refresh_tokens_nsfw_api(data: dict):
     }
 
 
-@router.post("/api/v1/admin/tokens/auto-register", dependencies=[Depends(verify_app_key)])
-async def auto_register_tokens_api(data: dict):
-    """Start auto registration."""
-    try:
-        data = data or {}
-        count = data.get("count")
-        concurrency = data.get("concurrency")
-        pool = (data.get("pool") or "ssoBasic").strip() or "ssoBasic"
-
-        try:
-            count_val = int(count)
-        except Exception:
-            count_val = int(get_config("register.default_count", 100) or 100)
-
-        if count_val <= 0:
-            count_val = int(get_config("register.default_count", 100) or 100)
-
-        try:
-            concurrency_val = int(concurrency)
-        except Exception:
-            concurrency_val = None
-        if concurrency_val is not None and concurrency_val <= 0:
-            concurrency_val = None
-
-        manager = get_auto_register_manager()
-        job = await manager.start_job(count=count_val, pool=pool, concurrency=concurrency_val)
-        return {"status": "started", "job": job.to_dict()}
-    except RuntimeError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-    except Exception:
-        logger.exception("Admin API error")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-
-@router.get("/api/v1/admin/tokens/auto-register/status", dependencies=[Depends(verify_app_key)])
-async def auto_register_status_api(job_id: str | None = None):
-    """Get auto registration status."""
-    manager = get_auto_register_manager()
-    status = manager.get_status(job_id)
-    if status.get("status") == "not_found":
-        raise HTTPException(status_code=404, detail="Job not found")
-    return status
-
-
-@router.post("/api/v1/admin/tokens/auto-register/stop", dependencies=[Depends(verify_app_key)])
-async def auto_register_stop_api(job_id: str | None = None):
-    """Stop auto registration (best-effort)."""
-    manager = get_auto_register_manager()
-    status = manager.get_status(job_id)
-    if status.get("status") == "not_found":
-        raise HTTPException(status_code=404, detail="Job not found")
-    await manager.stop_job()
-    return {"status": "stopping"}

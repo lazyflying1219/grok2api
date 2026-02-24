@@ -92,14 +92,6 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
-    # Best-effort: stop auto-register to avoid blocking shutdown on background threads.
-    try:
-        from app.services.register import get_auto_register_manager
-
-        await get_auto_register_manager().stop_job()
-    except Exception:
-        pass
-
     from app.core.storage import StorageFactory
 
     if StorageFactory._instance:

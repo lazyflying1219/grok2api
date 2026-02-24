@@ -5,7 +5,7 @@ from typing import Iterable, Any
 
 from app.core.config import get_config
 from app.core.logger import logger
-from app.services.register.services import (
+from app.services.account import (
     UserAgreementService,
     BirthDateService,
     NsfwSettingsService,

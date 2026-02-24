@@ -59,19 +59,3 @@ trusted_proxy_ips = [
 ]
 # Allow fetching/uploading remote resources from private IP ranges (SSRF risk).
 allow_private_fetch = false
-
-[register]
-worker_domain = ""
-email_domain = ""
-admin_password = ""
-yescaptcha_key = ""
-solver_url = "http://127.0.0.1:5072"
-# 推荐 camoufox（对 accounts.x.ai 的 Turnstile 成功率更高）；若环境未安装会自动回退到 chromium。
-solver_browser_type = "camoufox"
-solver_threads = 5
-register_threads = 10
-default_count = 100
-auto_start_solver = true
-solver_debug = false
-max_errors = 0
-max_runtime_minutes = 0

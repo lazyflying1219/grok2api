@@ -15,9 +15,6 @@ const NUMERIC_FIELDS = new Set([
   'assets_delete_batch_size',
   'admin_assets_batch_size',
   'reload_interval_sec',
-  'solver_threads',
-  'register_threads',
-  'default_count'
 ]);
 
 const LOCALE_MAP = {
@@ -77,22 +74,6 @@ const LOCALE_MAP = {
     "trusted_proxy_ips": { title: "可信代理 IP", desc: "允许传递转发头的代理 IP/CIDR 列表。仅这些来源的转发头会被采信，防止客户端伪造。" },
     "allow_private_fetch": { title: "允许内网抓取", desc: "是否允许服务端向内网地址（10.x / 172.16.x / 192.168.x）发起资源请求。关闭可防止 SSRF 攻击。" }
   },
-  "register": {
-    "label": "自动注册",
-    "worker_domain": { title: "Worker 域名", desc: "临时邮箱 Worker 的域名（不含 https://）。" },
-    "email_domain": { title: "邮箱域名", desc: "临时邮箱使用的域名，如 example.com。" },
-    "admin_password": { title: "邮箱管理密码", desc: "Worker 后台的管理密钥。" },
-    "yescaptcha_key": { title: "YesCaptcha Key", desc: "可选。填写后优先使用 YesCaptcha。" },
-    "solver_url": { title: "Solver 地址", desc: "本地 Turnstile Solver 地址，默认 http://127.0.0.1:5072。" },
-    "solver_browser_type": { title: "Solver 浏览器", desc: "Solver 使用的浏览器类型：chromium / chrome / msedge / camoufox。建议使用 camoufox（对 accounts.x.ai 成功率更高）。" },
-    "solver_threads": { title: "Solver 线程数", desc: "自动启动 Solver 时的线程数，默认 5。" },
-    "register_threads": { title: "注册线程数", desc: "注册并发线程数，默认 10。" },
-    "default_count": { title: "默认注册数量", desc: "未填写数量时默认注册多少个，默认 100。" },
-    "auto_start_solver": { title: "自动启动 Solver", desc: "注册时自动启动本地 Solver。" },
-    "solver_debug": { title: "Solver 调试", desc: "启动 Solver 时开启调试日志。" },
-    "max_errors": { title: "最大错误数", desc: "失败次数超过阈值会自动停止注册。0 表示自动计算。"},
-    "max_runtime_minutes": { title: "最长运行时间(分钟)", desc: "超过指定分钟数后自动停止注册。0 表示不限制。"}
-  }
 };
 
 function getText(section, key) {

@@ -72,10 +72,10 @@ python scripts/smoke_test.py --base-url http://127.0.0.1:8000
 默认账号密码：`admin` / `admin`（对应配置项 `app.admin_username` / `app.app_key`，建议上线后修改）。
 
 常用页面：
-- `http://<host>:8000/admin/token`：Token 管理（导入/导出/批量操作/自动注册）
+- `http://<host>:8000/admin/token`：Token 管理（导入/导出/批量操作）
 - `http://<host>:8000/admin/keys`：API Key 管理（统计/筛选/新增/编辑/删除）
 - `http://<host>:8000/admin/datacenter`：数据中心（常用指标 + 日志查看）
-- `http://<host>:8000/admin/config`：配置管理（含自动注册所需配置）
+- `http://<host>:8000/admin/config`：配置管理
 - `http://<host>:8000/admin/cache`：缓存管理（本地缓存 + 在线资产）
 
 ### 手机端适配（全站）
@@ -113,27 +113,6 @@ python scripts/smoke_test.py --base-url http://127.0.0.1:8000
   - 创建成功后支持一键复制 Key
 - 错误提示优化：前端优先展示后端 `detail/error/message`，避免“创建失败/更新失败”无上下文。
 - 更新不存在的 Key 会返回 `404`（FastAPI 与 Workers 一致）。
-
-### 自动注册（Token 管理 -> 添加 -> 自动注册）
-
-支持两种方式：
-- 直接添加 Token（手动/批量导入）
-- 自动注册并自动写入 Token 池
-
-自动注册特性：
-- 可设置注册数量（不填默认 `100`）
-- 可设置并发（默认 `10`）
-- 注册前会自动启动本地 Turnstile Solver（默认 5 线程），注册结束后自动关闭
-- 注册成功后会自动执行：同意用户协议（TOS）+ 设置年龄 + 开启 NSFW
-  - 若 TOS / 年龄 / NSFW 任一步骤失败，会判定该次注册失败并在前端显示错误原因
-
-自动注册前置配置（在「配置管理」-> `register.*`）：
-- `register.worker_domain` / `register.email_domain` / `register.admin_password`：临时邮箱 Worker 配置
-- `register.solver_url` / `register.solver_browser_type` / `register.solver_threads`：本地 Turnstile Solver 配置
-- 可选：`register.yescaptcha_key`（配置后优先走 YesCaptcha，无需本地 solver）
-
-升级兼容：
-- 本地部署升级后会自动对「旧 Token」做一次 TOS + 设置年龄 + NSFW（并发 10，best-effort，仅执行一次，避免重复刷）。
 
 ### 环境变量
 
