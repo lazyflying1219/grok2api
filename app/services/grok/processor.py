@@ -67,7 +67,7 @@ def _build_video_html(video_url: str, thumbnail_url: str = "") -> str:
 
 class BaseProcessor:
     """基础处理器"""
-    
+
     def __init__(self, model: str, token: str = ""):
         self.model = model
         self.token = token
@@ -84,7 +84,13 @@ class BaseProcessor:
             "object": "chat.completion.chunk",
             "created": self.created,
             "model": self.model,
+            "system_fingerprint": "",
         }
+
+    def _update_fingerprint(self, fp: str):
+        """Update fingerprint and sync to chunk template."""
+        self.fingerprint = fp
+        self._chunk_template["system_fingerprint"] = fp
 
     def _get_dl(self) -> DownloadService:
         """获取下载服务实例（复用）"""
@@ -133,7 +139,6 @@ class BaseProcessor:
             delta["content"] = ""
 
         chunk = self._chunk_template.copy()
-        chunk["system_fingerprint"] = self.fingerprint
         chunk["choices"] = [{"index": 0, "delta": delta, "logprobs": None, "finish_reason": finish}]
         return f"data: {orjson.dumps(chunk).decode()}\n\n"
 
@@ -149,7 +154,7 @@ class StreamProcessor(BaseProcessor):
         self.image_format = get_config("app.image_format", "url")
         self.prompt_tokens = prompt_tokens
         self._completion_tokens = 0
-        self._raw_completion_text = ""
+        self._raw_parts: list[str] = []
 
         if think is None:
             self.show_think = get_config("grok.thinking", False)
@@ -179,7 +184,7 @@ class StreamProcessor(BaseProcessor):
                 
                 # 元数据
                 if (llm := resp.get("llmInfo")) and not self.fingerprint:
-                    self.fingerprint = llm.get("modelHash", "")
+                    self._update_fingerprint(llm.get("modelHash", ""))
                 
                 # 图像生成进度
                 if img := resp.get("streamingImageGenerationResponse"):
@@ -218,20 +223,20 @@ class StreamProcessor(BaseProcessor):
                             yield _emit(f"![{img_id}]({final_url})\n")
                     
                     if (meta := mr.get("metadata", {})).get("llm_info", {}).get("modelHash"):
-                        self.fingerprint = meta["llm_info"]["modelHash"]
+                        self._update_fingerprint(meta["llm_info"]["modelHash"])
                     continue
-                
+
                 # 普通 token
                 if (token := resp.get("token")) is not None:
                     if token and not (self.filter_tags and any(t in token for t in self.filter_tags)):
-                        self._raw_completion_text += token
+                        self._raw_parts.append(token)
                         yield _emit(token)
 
             if self.think_opened:
                 yield _emit("</think>\n")
             yield self._sse(finish="stop")
             # Batch-count completion tokens once (much cheaper than per-token encoding)
-            self._completion_tokens = await _count_tokens_async(self._raw_completion_text)
+            self._completion_tokens = await _count_tokens_async("".join(self._raw_parts))
             # usage chunk (OpenAI spec: separate chunk with choices=[] before [DONE])
             completion_tokens = self._completion_tokens
             total = self.prompt_tokens + completion_tokens

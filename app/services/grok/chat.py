@@ -199,24 +199,53 @@ class MessageExtractor:
 
 class ChatRequestBuilder:
     """请求构造器"""
-    
+
+    # 静态 payload 字段，运行时 copy() 后设置动态字段
+    _STATIC_PAYLOAD: dict = {
+        "imageAttachments": [],
+        "disableSearch": False,
+        "enableImageGeneration": True,
+        "returnImageBytes": False,
+        "returnRawGrokInXaiRequest": False,
+        "enableImageStreaming": True,
+        "imageGenerationCount": 2,
+        "forceConcise": False,
+        "toolOverrides": {},
+        "enableSideBySide": True,
+        "sendFinalMetadata": True,
+        "isReasoning": False,
+        "disableTextFollowUps": False,
+        "disableMemory": False,
+        "forceSideBySide": False,
+        "isAsyncChat": False,
+        "disableSelfHarmShortCircuit": False,
+        "deviceEnvInfo": {
+            "darkModeEnabled": False,
+            "devicePixelRatio": 2,
+            "screenWidth": 2056,
+            "screenHeight": 1329,
+            "viewportWidth": 2056,
+            "viewportHeight": 1083
+        }
+    }
+
     @staticmethod
     def build_headers(token: str) -> Dict[str, str]:
         """构造请求头"""
         return build_grok_headers(token)
-    
+
     @staticmethod
     def build_payload(
-        message: str, 
-        model: str, 
-        mode: str, 
+        message: str,
+        model: str,
+        mode: str,
         think: bool = None,
         file_attachments: List[str] = None,
         image_attachments: List[str] = None
     ) -> Dict[str, Any]:
         """
         构造请求体
-        
+
         Args:
             message: 消息文本
             model: 模型名称
@@ -235,43 +264,18 @@ class ChatRequestBuilder:
             merged_attachments.extend(file_attachments)
         if image_attachments:
             merged_attachments.extend(image_attachments)
-        
-        return {
-            "temporary": temporary,
-            "modelName": model,
-            "modelMode": mode,
-            "message": message,
-            "fileAttachments": merged_attachments,
-            "imageAttachments": [],
-            "disableSearch": False,
-            "enableImageGeneration": True,
-            "returnImageBytes": False,
-            "returnRawGrokInXaiRequest": False,
-            "enableImageStreaming": True,
-            "imageGenerationCount": 2,
-            "forceConcise": False,
-            "toolOverrides": {},
-            "enableSideBySide": True,
-            "sendFinalMetadata": True,
-            "isReasoning": False,
-            "disableTextFollowUps": False,
-            "responseMetadata": {
-                "modelConfigOverride": {"modelMap": {}},
-                "requestModelDetails": {"modelId": model}
-            },
-            "disableMemory": False,
-            "forceSideBySide": False,
-            "isAsyncChat": False,
-            "disableSelfHarmShortCircuit": False,
-            "deviceEnvInfo": {
-                "darkModeEnabled": False,
-                "devicePixelRatio": 2,
-                "screenWidth": 2056,
-                "screenHeight": 1329,
-                "viewportWidth": 2056,
-                "viewportHeight": 1083
-            }
+
+        payload = ChatRequestBuilder._STATIC_PAYLOAD.copy()
+        payload["temporary"] = temporary
+        payload["modelName"] = model
+        payload["modelMode"] = mode
+        payload["message"] = message
+        payload["fileAttachments"] = merged_attachments
+        payload["responseMetadata"] = {
+            "modelConfigOverride": {"modelMap": {}},
+            "requestModelDetails": {"modelId": model}
         }
+        return payload
 
 
 # ==================== Grok 服务 ====================

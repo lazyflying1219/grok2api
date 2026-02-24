@@ -30,11 +30,13 @@ def _build_client(monkeypatch, enabled: bool, exempt_ips=None, ban_file=None) ->
         )
 
     cls = response_middleware_mod.ResponseLoggerMiddleware
-    cls._banned_ips.clear()
+    cls._banned_ips = frozenset()
     if hasattr(cls, "_banned_ips_loaded"):
         cls._banned_ips_loaded = False
     if hasattr(cls, "_banned_ips_file_mtime"):
         cls._banned_ips_file_mtime = None
+    if hasattr(cls, "_banned_file_checked_at"):
+        cls._banned_file_checked_at = 0.0
 
     app = FastAPI()
     app.add_middleware(response_middleware_mod.ResponseLoggerMiddleware)
@@ -99,11 +101,13 @@ def test_auto_ban_loads_from_file_after_restart(monkeypatch, tmp_path):
     assert first.status_code == 403
 
     # 模拟进程重启：清空内存封禁列表，仅保留文件。
-    response_middleware_mod.ResponseLoggerMiddleware._banned_ips.clear()
+    response_middleware_mod.ResponseLoggerMiddleware._banned_ips = frozenset()
     if hasattr(response_middleware_mod.ResponseLoggerMiddleware, "_banned_ips_loaded"):
         response_middleware_mod.ResponseLoggerMiddleware._banned_ips_loaded = False
     if hasattr(response_middleware_mod.ResponseLoggerMiddleware, "_banned_ips_file_mtime"):
         response_middleware_mod.ResponseLoggerMiddleware._banned_ips_file_mtime = None
+    if hasattr(response_middleware_mod.ResponseLoggerMiddleware, "_banned_file_checked_at"):
+        response_middleware_mod.ResponseLoggerMiddleware._banned_file_checked_at = 0.0
 
     second_client = _build_client(monkeypatch, enabled=True, ban_file=ban_file)
     second = second_client.get("/health")

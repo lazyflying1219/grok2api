@@ -28,6 +28,8 @@ LEGACY_API_KEYS_FILE = Path(__file__).parent.parent.parent / "data" / "api_keys.
 _legacy_api_keys_cache: Set[str] | None = None
 _legacy_api_keys_mtime: float | None = None
 _legacy_api_keys_lock = asyncio.Lock()
+_legacy_keys_checked_at: float = 0.0
+_LEGACY_KEYS_COOLDOWN: float = 10.0
 
 
 # ============= Session Token =============
@@ -114,11 +116,17 @@ async def _load_legacy_api_keys() -> Set[str]:
     Older versions stored multiple API keys in `data/api_keys.json` with a shape like:
     [{"key": "...", "is_active": true, ...}, ...]
     """
-    global _legacy_api_keys_cache, _legacy_api_keys_mtime
+    global _legacy_api_keys_cache, _legacy_api_keys_mtime, _legacy_keys_checked_at
+
+    # Fast path: if cache is populated and within cooldown, skip all I/O
+    now = time.monotonic()
+    if _legacy_api_keys_cache is not None and now - _legacy_keys_checked_at < _LEGACY_KEYS_COOLDOWN:
+        return _legacy_api_keys_cache
 
     if not LEGACY_API_KEYS_FILE.exists():
         _legacy_api_keys_cache = set()
         _legacy_api_keys_mtime = None
+        _legacy_keys_checked_at = now
         return set()
 
     try:
@@ -128,6 +136,7 @@ async def _load_legacy_api_keys() -> Set[str]:
         mtime = None
 
     if _legacy_api_keys_cache is not None and mtime is not None and _legacy_api_keys_mtime == mtime:
+        _legacy_keys_checked_at = now
         return _legacy_api_keys_cache
 
     async with _legacy_api_keys_lock:
@@ -135,6 +144,7 @@ async def _load_legacy_api_keys() -> Set[str]:
         if not LEGACY_API_KEYS_FILE.exists():
             _legacy_api_keys_cache = set()
             _legacy_api_keys_mtime = None
+            _legacy_keys_checked_at = time.monotonic()
             return set()
 
         try:
@@ -144,6 +154,7 @@ async def _load_legacy_api_keys() -> Set[str]:
             mtime = None
 
         if _legacy_api_keys_cache is not None and mtime is not None and _legacy_api_keys_mtime == mtime:
+            _legacy_keys_checked_at = time.monotonic()
             return _legacy_api_keys_cache
 
         try:
@@ -164,6 +175,7 @@ async def _load_legacy_api_keys() -> Set[str]:
 
         _legacy_api_keys_cache = keys
         _legacy_api_keys_mtime = mtime
+        _legacy_keys_checked_at = time.monotonic()
         return keys
 
 

@@ -32,11 +32,13 @@ def _build_client(monkeypatch, *, trust_proxy_headers: bool, trusted_proxy_ips=N
     )
 
     cls = response_middleware_mod.ResponseLoggerMiddleware
-    cls._banned_ips.clear()
+    cls._banned_ips = frozenset()
     if hasattr(cls, "_banned_ips_loaded"):
         cls._banned_ips_loaded = False
     if hasattr(cls, "_banned_ips_file_mtime"):
         cls._banned_ips_file_mtime = None
+    if hasattr(cls, "_banned_file_checked_at"):
+        cls._banned_file_checked_at = 0.0
 
     app = FastAPI()
     app.add_middleware(response_middleware_mod.ResponseLoggerMiddleware)

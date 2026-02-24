@@ -10,6 +10,7 @@ from app.services.token.models import TokenInfo, EffortType, TokenPoolStats, FAI
 from app.core.storage import get_storage
 from app.core.config import get_config
 from app.services.token.pool import TokenPool
+from app.services.grok.model import ModelService
 
 # 批量刷新配置
 REFRESH_INTERVAL_HOURS = 8
@@ -216,16 +217,15 @@ class TokenManager:
         返回:
             (token, request_id)；若无可用 token，返回 (None, None)
         """
+        await self.reload_if_stale()
+
         now_ms = _now_ms()
         ttl_ms = self._reserve_ttl_ms()
         request_id = uuid.uuid4().hex
         excluded = set(exclude or set())
 
+        selected_token = None
         async with self._select_lock:
-            await self.reload_if_stale()
-
-            from app.services.grok.model import ModelService
-
             bucket = "heavy" if ModelService.is_heavy_bucket_model(model_id) else "normal"
             for pool_name in ModelService.pool_candidates_for_model(model_id):
                 pool = self.pools.get(pool_name)
@@ -238,9 +238,12 @@ class TokenManager:
 
                 token_info.inflight_until = now_ms + ttl_ms
                 token_info.inflight_request_id = request_id
-                self._schedule_save()
-                token = token_info.token
-                return token[4:] if token.startswith("sso=") else token, request_id
+                selected_token = token_info.token
+                break
+
+        if selected_token is not None:
+            self._schedule_save()
+            return selected_token[4:] if selected_token.startswith("sso=") else selected_token, request_id
 
         return None, None
 
@@ -258,7 +261,6 @@ class TokenManager:
             return False
 
         async with self._select_lock:
-            await self.reload_if_stale()
             token, _ = self._find_token_info(raw_token)
             if not token:
                 return False
@@ -270,16 +272,17 @@ class TokenManager:
             if current_until <= now_ms:
                 token.inflight_until = 0
                 token.inflight_request_id = None
-                self._schedule_save()
-                return True
-
-            if current_request_id != request_id:
+                need_save = True
+            elif current_request_id != request_id:
                 return False
+            else:
+                token.inflight_until = 0
+                token.inflight_request_id = None
+                need_save = True
 
-            token.inflight_until = 0
-            token.inflight_request_id = None
+        if need_save:
             self._schedule_save()
-            return True
+        return True
 
     def get_token(self, pool_name: str = "ssoBasic") -> Optional[str]:
         """
@@ -308,8 +311,6 @@ class TokenManager:
 
     def get_token_for_model(self, model_id: str, exclude: Optional[set] = None) -> Optional[str]:
         """按模型选择可用 Token（包含 basic->super 回退与 heavy 配额桶选择）。"""
-        from app.services.grok.model import ModelService
-
         bucket = "heavy" if ModelService.is_heavy_bucket_model(model_id) else "normal"
         for pool_name in ModelService.pool_candidates_for_model(model_id):
             pool = self.pools.get(pool_name)
@@ -452,8 +453,6 @@ class TokenManager:
         if not target_token:
             logger.warning(f"Token {raw_token}: not found for sync")
             return False
-
-        from app.services.grok.model import ModelService
 
         bucket = "heavy" if ModelService.is_heavy_bucket_model(model_id) else "normal"
         rate_limit_model = ModelService.rate_limit_model_for(model_id)

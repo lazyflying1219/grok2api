@@ -25,11 +25,13 @@ class ResponseLoggerMiddleware(BaseHTTPMiddleware):
     Request Logging and Response Tracking Middleware
     """
 
-    _banned_ips: set[str] = set()
+    _banned_ips: frozenset[str] = frozenset()
     _banned_lock = asyncio.Lock()
     _ban_file_path: Path = Path(__file__).parent.parent.parent / "data" / "banned_ips.txt"
     _banned_ips_loaded: bool = False
     _banned_ips_file_mtime: float | None = None
+    _banned_file_checked_at: float = 0.0
+    _BANNED_FILE_COOLDOWN: float = 5.0
 
     # Cache for trusted proxy rules
     _proxy_rules_raw = None
@@ -188,6 +190,11 @@ class ResponseLoggerMiddleware(BaseHTTPMiddleware):
 
     @classmethod
     async def _refresh_banned_ips_from_file_locked(cls):
+        now = time.monotonic()
+        if now - cls._banned_file_checked_at < cls._BANNED_FILE_COOLDOWN:
+            return
+        cls._banned_file_checked_at = now
+
         path = cls._ban_file_path
         try:
             mtime = path.stat().st_mtime if path.exists() else None
@@ -209,7 +216,7 @@ class ResponseLoggerMiddleware(BaseHTTPMiddleware):
             except Exception as e:
                 logger.warning(f"Failed to load banned IP file {path}: {e}")
 
-        cls._banned_ips = loaded
+        cls._banned_ips = frozenset(loaded)
         cls._banned_ips_loaded = True
         cls._banned_ips_file_mtime = mtime
 
@@ -226,6 +233,7 @@ class ResponseLoggerMiddleware(BaseHTTPMiddleware):
             await asyncio.to_thread(os.replace, tmp_path, path)
             cls._banned_ips_file_mtime = path.stat().st_mtime
             cls._banned_ips_loaded = True
+            cls._banned_file_checked_at = time.monotonic()
         except Exception as e:
             logger.warning(f"Failed to persist banned IP file {path}: {e}")
 
@@ -233,12 +241,14 @@ class ResponseLoggerMiddleware(BaseHTTPMiddleware):
     async def _ban_ip(cls, client_ip: str):
         if not client_ip:
             return
+        if client_ip in cls._banned_ips:
+            return
         async with cls._banned_lock:
             if cls._file_persistence_enabled():
                 await cls._refresh_banned_ips_from_file_locked()
             if client_ip in cls._banned_ips:
                 return
-            cls._banned_ips.add(client_ip)
+            cls._banned_ips = cls._banned_ips | frozenset({client_ip})
             if cls._file_persistence_enabled():
                 await cls._persist_banned_ips_to_file_locked()
 
@@ -246,10 +256,14 @@ class ResponseLoggerMiddleware(BaseHTTPMiddleware):
     async def _is_ip_banned(cls, client_ip: str) -> bool:
         if not client_ip:
             return False
-        async with cls._banned_lock:
-            if cls._file_persistence_enabled():
+        # File persistence mode: periodically refresh from disk (behind cooldown)
+        if cls._file_persistence_enabled() and (
+            not cls._banned_ips_loaded
+            or time.monotonic() - cls._banned_file_checked_at >= cls._BANNED_FILE_COOLDOWN
+        ):
+            async with cls._banned_lock:
                 await cls._refresh_banned_ips_from_file_locked()
-            return client_ip in cls._banned_ips
+        return client_ip in cls._banned_ips
     
     async def dispatch(self, request: Request, call_next):
         # 生成请求 ID
