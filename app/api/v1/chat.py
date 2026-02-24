@@ -98,7 +98,7 @@ class ChatCompletionRequest(BaseModel):
     """Chat Completions 请求"""
     model: str = Field(..., description="模型名称")
     messages: List[MessageItem] = Field(..., description="消息数组")
-    stream: Optional[bool] = Field(None, description="是否流式输出")
+    stream: Optional[bool] = Field(False, description="是否流式输出")
     thinking: Optional[str] = Field(None, description="思考模式: enabled/disabled/None")
     
     # 视频生成配置
@@ -212,6 +212,9 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
     # Daily quota (best-effort)
     await enforce_daily_quota(api_key, request.model)
     
+    # 兼容 OpenAI：仅在显式 true 时走流式，缺省/null 一律按非流式处理
+    is_stream = request.stream is True
+
     # 检测视频模型
     model_info = ModelService.get(request.model)
     if model_info and model_info.is_video:
@@ -223,7 +226,7 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
         result = await VideoService.completions(
             model=request.model,
             messages=[msg.model_dump() for msg in request.messages],
-            stream=request.stream,
+            stream=is_stream,
             thinking=request.thinking,
             aspect_ratio=v_conf.aspect_ratio,
             video_length=v_conf.video_length,
@@ -234,7 +237,7 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
         result = await ChatService.completions(
             model=request.model,
             messages=[msg.model_dump() for msg in request.messages],
-            stream=request.stream,
+            stream=is_stream,
             thinking=request.thinking
         )
     
