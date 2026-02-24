@@ -3,7 +3,8 @@
 import asyncio
 import time
 import uuid
-from typing import Dict, List, Optional
+from contextlib import suppress
+from typing import Dict, List, Optional, Any, Coroutine
 
 from app.core.logger import logger
 from app.services.token.models import TokenInfo, EffortType, TokenPoolStats, FAIL_THRESHOLD, TokenStatus, _now_ms
@@ -35,6 +36,32 @@ class TokenManager:
         self._save_delay = 0.5
         self._last_reload_at = 0.0
         self._select_lock = asyncio.Lock()
+
+    def _create_save_task(self, coro: Coroutine[Any, Any, Any]):
+        task = asyncio.create_task(coro)
+        self._save_task = task
+
+        def _done(t: asyncio.Task):
+            if self._save_task is t:
+                self._save_task = None
+
+            if t.cancelled():
+                return
+
+            try:
+                _ = t.result()
+            except Exception as e:
+                logger.warning(f"TokenManager save task failed: {e}")
+
+            if self._dirty:
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    return
+                self._schedule_save()
+
+        task.add_done_callback(_done)
+        return task
     
     @classmethod
     async def get_instance(cls) -> "TokenManager":
@@ -141,29 +168,54 @@ class TokenManager:
         if self._save_delay == 0:
             if self._save_task and not self._save_task.done():
                 return
-            self._save_task = asyncio.create_task(self._save())
+            self._create_save_task(self._save())
             return
         if self._save_task and not self._save_task.done():
             return
-        self._save_task = asyncio.create_task(self._flush_loop())
+        self._create_save_task(self._flush_loop())
 
     async def _flush_loop(self):
-        try:
-            while True:
-                await asyncio.sleep(self._save_delay)
-                if not self._dirty:
-                    break
-                self._dirty = False
-                await self._save()
-        finally:
-            self._save_task = None
-            if self._dirty:
-                try:
-                    asyncio.get_running_loop()
-                except RuntimeError:
-                    pass
-                else:
-                    self._schedule_save()
+        while True:
+            await asyncio.sleep(self._save_delay)
+            if not self._dirty:
+                break
+            self._dirty = False
+            await self._save()
+
+    async def close(self, flush: bool = True):
+        """关闭后台任务并可选落盘，供进程退出时调用。"""
+        task = self._save_task
+        self._save_task = None
+        if task:
+            if not task.done():
+                task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+        if flush and self._dirty:
+            self._dirty = False
+            await self._save()
+
+        inflight_tasks = set(self._usage_sync_tasks)
+        inflight_tasks.update(self._inflight_syncs.values())
+        for t in inflight_tasks:
+            if not t.done():
+                t.cancel()
+        for t in inflight_tasks:
+            with suppress(asyncio.CancelledError, Exception):
+                await t
+
+        self._usage_sync_tasks.clear()
+        self._inflight_syncs.clear()
+
+    @classmethod
+    async def close_instance(cls, flush: bool = True):
+        """关闭全局单例实例（若存在）。"""
+        async with cls._lock:
+            inst = cls._instance
+            cls._instance = None
+        if inst is not None:
+            await inst.close(flush=flush)
 
     @staticmethod
     def _extract_cookie_value(cookie_str: str, name: str) -> str | None:

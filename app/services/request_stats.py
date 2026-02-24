@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Dict, Any
 from pathlib import Path
 from collections import defaultdict
+from contextlib import suppress
 
 from app.core.logger import logger
 
@@ -44,6 +45,32 @@ class RequestStats:
         self._flush_delay = 2.0  # 秒
 
         self._initialized = True
+
+    def _create_flush_task(self):
+        task = asyncio.create_task(self._flush_loop())
+        self._flush_task = task
+
+        def _done(t: asyncio.Task):
+            if self._flush_task is t:
+                self._flush_task = None
+
+            if t.cancelled():
+                return
+
+            try:
+                _ = t.result()
+            except Exception as e:
+                logger.warning(f"[Stats] flush task failed: {e}")
+
+            if self._dirty:
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    return
+                self._schedule_save()
+
+        task.add_done_callback(_done)
+        return task
 
     async def init(self):
         """初始化加载数据"""
@@ -152,26 +179,16 @@ class RequestStats:
         self._dirty = True
         if self._flush_task and not self._flush_task.done():
             return
-        self._flush_task = asyncio.create_task(self._flush_loop())
+        self._create_flush_task()
 
     async def _flush_loop(self):
         """延迟合并写入循环"""
-        try:
-            while True:
-                await asyncio.sleep(self._flush_delay)
-                if not self._dirty:
-                    break
-                self._dirty = False
-                await self._save_data()
-        finally:
-            self._flush_task = None
-            if self._dirty:
-                try:
-                    asyncio.get_running_loop()
-                except RuntimeError:
-                    pass
-                else:
-                    self._schedule_save()
+        while True:
+            await asyncio.sleep(self._flush_delay)
+            if not self._dirty:
+                break
+            self._dirty = False
+            await self._save_data()
     
     def get_stats(self, hours: int = 24, days: int = 7) -> Dict[str, Any]:
         """获取统计数据"""
@@ -228,6 +245,20 @@ class RequestStats:
         self._daily.clear()
         self._models.clear()
         await self._save_data()
+
+    async def close(self, flush: bool = True) -> None:
+        """关闭后台 flush 任务并可选落盘。"""
+        task = self._flush_task
+        self._flush_task = None
+        if task:
+            if not task.done():
+                task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+        if flush and self._dirty:
+            self._dirty = False
+            await self._save_data()
 
 
 # 全局实例

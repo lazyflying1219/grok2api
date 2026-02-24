@@ -92,6 +92,19 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
+    # 关闭后台任务（token 持久化/request stats flush）
+    try:
+        from app.services.token.manager import TokenManager
+        await TokenManager.close_instance(flush=True)
+    except Exception:
+        pass
+
+    try:
+        from app.services.request_stats import request_stats
+        await request_stats.close(flush=True)
+    except Exception:
+        pass
+
     from app.core.storage import StorageFactory
 
     if StorageFactory._instance:

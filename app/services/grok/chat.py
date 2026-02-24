@@ -55,6 +55,48 @@ async def close_shared_session() -> None:
 
 
 _enc = tiktoken.get_encoding("o200k_base")
+_BATCH_ENCODE_MIN_PARTS = 32
+_BATCH_ENCODE_MIN_TOTAL_CHARS = 20000
+_BATCH_ENCODE_MIN_AVG_CHARS = 400
+_BATCH_ENCODE_THREADS = 4
+
+
+def _get_int_config(key: str, default: int, *, min_value: int = 1, max_value: int | None = None) -> int:
+    value = get_config(key, default)
+    try:
+        value = int(value)
+    except Exception:
+        value = default
+    if value < min_value:
+        value = min_value
+    if max_value is not None and value > max_value:
+        value = max_value
+    return value
+
+
+def _prompt_token_batch_config() -> tuple[int, int, int, int]:
+    min_parts = _get_int_config(
+        "performance.prompt_token_batch_min_parts",
+        _BATCH_ENCODE_MIN_PARTS,
+        min_value=1,
+    )
+    min_total_chars = _get_int_config(
+        "performance.prompt_token_batch_min_total_chars",
+        _BATCH_ENCODE_MIN_TOTAL_CHARS,
+        min_value=1,
+    )
+    min_avg_chars = _get_int_config(
+        "performance.prompt_token_batch_min_avg_chars",
+        _BATCH_ENCODE_MIN_AVG_CHARS,
+        min_value=1,
+    )
+    threads = _get_int_config(
+        "performance.prompt_token_batch_threads",
+        _BATCH_ENCODE_THREADS,
+        min_value=1,
+        max_value=32,
+    )
+    return min_parts, min_total_chars, min_avg_chars, threads
 
 
 async def _count_prompt_tokens(messages: List[Dict[str, Any]]) -> int:
@@ -63,20 +105,49 @@ async def _count_prompt_tokens(messages: List[Dict[str, Any]]) -> int:
     BPE encoding is CPU-intensive, so the actual work runs in a thread pool
     to avoid blocking the asyncio event loop on large prompts.
     """
+    min_parts, min_total_chars, min_avg_chars, threads = _prompt_token_batch_config()
+
     def _encode() -> int:
         total = 3  # base overhead (<|start|>assistant<|message|>)
+        text_parts: list[str] = []
+        text_chars = 0
         for msg in messages:
             total += 4  # per-message overhead (role, delimiters)
             content = msg.get("content", "")
             if isinstance(content, str):
                 if content:
-                    total += len(_enc.encode(content))
+                    text_parts.append(content)
+                    text_chars += len(content)
             elif isinstance(content, list):
                 for item in content:
                     if item.get("type") == "text":
                         text = item.get("text", "")
                         if text:
-                            total += len(_enc.encode(text))
+                            text_parts.append(text)
+                            text_chars += len(text)
+        if text_parts:
+            use_batch = False
+            if len(text_parts) >= min_parts:
+                avg_chars = text_chars // len(text_parts)
+                use_batch = (
+                    text_chars >= min_total_chars
+                    and avg_chars >= min_avg_chars
+                )
+            if use_batch:
+                try:
+                    total += sum(
+                        len(tokens)
+                        for tokens in _enc.encode_batch(
+                            text_parts,
+                            num_threads=threads,
+                        )
+                    )
+                    return total
+                except Exception:
+                    # Fallback for non-standard encoder implementations used in tests/mocks.
+                    pass
+
+            total += sum(len(_enc.encode(text)) for text in text_parts)
         return total
     return await asyncio.to_thread(_encode)
 

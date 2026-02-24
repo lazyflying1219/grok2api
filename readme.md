@@ -367,6 +367,10 @@ curl http://localhost:8000/v1/images/edits \
 |                       | `usage_max_concurrent`     | 用量并发上限 | 用量查询请求的并发上限。推荐 25。                    | `25`                                                    |
 |                       | `assets_delete_batch_size` | 资产清理批量 | 在线资产删除单批并发数量。推荐 10。                  | `10`                                                    |
 |                       | `admin_assets_batch_size`  | 管理端批量   | 管理端在线资产统计/清理批量并发数量。推荐 10。       | `10`                                                    |
+|                       | `prompt_token_batch_min_parts` | Prompt 批量分词最小片段数 | 触发批量分词（encode_batch）的最小文本片段数量。 | `32` |
+|                       | `prompt_token_batch_min_total_chars` | Prompt 批量分词最小总字符数 | 触发批量分词的最小文本总字符数。 | `20000` |
+|                       | `prompt_token_batch_min_avg_chars` | Prompt 批量分词最小平均长度 | 触发批量分词的最小片段平均字符数。 | `400` |
+|                       | `prompt_token_batch_threads` | Prompt 批量分词线程数 | `encode_batch` 使用的线程数。 | `4` |
 
 <br>
 

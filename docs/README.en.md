@@ -338,6 +338,10 @@ When upgrading from older versions, the service will keep existing local data an
 | | `usage_max_concurrent` | Usage concurrency | Concurrency cap for usage queries. Recommended 25. | `25` |
 | | `assets_delete_batch_size` | Asset cleanup batch | Batch concurrency for online asset deletion. Recommended 10. | `10` |
 | | `admin_assets_batch_size` | Admin cleanup batch | Batch concurrency for admin asset stats/cleanup. Recommended 10. | `10` |
+| | `prompt_token_batch_min_parts` | Prompt batch min parts | Minimum text-part count to enable prompt token `encode_batch`. | `32` |
+| | `prompt_token_batch_min_total_chars` | Prompt batch min total chars | Minimum total characters to enable prompt token `encode_batch`. | `20000` |
+| | `prompt_token_batch_min_avg_chars` | Prompt batch min avg chars | Minimum average characters per part to enable prompt token `encode_batch`. | `400` |
+| | `prompt_token_batch_threads` | Prompt batch threads | Thread count used by prompt token `encode_batch`. | `4` |
 
 <br>
 

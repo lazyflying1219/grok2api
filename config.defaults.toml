@@ -42,6 +42,10 @@ media_max_concurrent = 50
 usage_max_concurrent = 25
 assets_delete_batch_size = 10
 admin_assets_batch_size = 10
+prompt_token_batch_min_parts = 32
+prompt_token_batch_min_total_chars = 20000
+prompt_token_batch_min_avg_chars = 400
+prompt_token_batch_threads = 4
 
 [security]
 auto_ban_unknown_path = false
