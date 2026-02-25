@@ -47,6 +47,12 @@ prompt_token_batch_min_total_chars = 20000
 prompt_token_batch_min_avg_chars = 400
 prompt_token_batch_threads = 4
 
+[database]
+pool_size = 20
+max_overflow = 10
+pool_recycle = 3600
+pool_pre_ping = true
+
 [security]
 auto_ban_unknown_path = false
 auto_ban_exempt_ips = ["127.0.0.1", "::1"]

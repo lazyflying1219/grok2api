@@ -473,19 +473,43 @@ class SQLStorage(BaseStorage):
             raise ImportError("需要安装 sqlalchemy 和 async 驱动: pip install sqlalchemy[asyncio]")
 
         self.dialect = url.split(":", 1)[0].split("+", 1)[0].lower()
-        
-        # 配置 robust 的连接池
+
+        # Read pool params directly from TOML files to avoid circular dependency
+        # (config.load() depends on storage, which we're creating right now)
+        db_cfg = self._read_db_config()
+
         self.engine = create_async_engine(
             url,
             echo=False,
-            pool_size=20,
-            max_overflow=10,
-            pool_recycle=3600,
-            pool_pre_ping=True
+            pool_size=db_cfg["pool_size"],
+            max_overflow=db_cfg["max_overflow"],
+            pool_recycle=db_cfg["pool_recycle"],
+            pool_pre_ping=db_cfg["pool_pre_ping"],
         )
         self.async_session = async_sessionmaker(self.engine, expire_on_commit=False)
-        self._initialized = False 
+        self._initialized = False
     
+    @staticmethod
+    def _read_db_config() -> dict:
+        """Read [database] section directly from TOML files (no storage dependency)."""
+        defaults = {"pool_size": 20, "max_overflow": 10, "pool_recycle": 3600, "pool_pre_ping": True}
+        defaults_file = Path(__file__).parent.parent.parent / "config.defaults.toml"
+        override_file = CONFIG_FILE  # data/config.toml
+        for path in (defaults_file, override_file):
+            if not path.exists():
+                continue
+            try:
+                with path.open("rb") as f:
+                    data = tomllib.load(f)
+                db = data.get("database")
+                if isinstance(db, dict):
+                    for k in defaults:
+                        if k in db:
+                            defaults[k] = type(defaults[k])(db[k])
+            except Exception:
+                pass
+        return defaults
+
     async def _ensure_schema(self):
         """确保数据库表存在"""
         if self._initialized: return
@@ -608,24 +632,27 @@ class SQLStorage(BaseStorage):
         await self._ensure_schema()
         from sqlalchemy import text
         try:
-            async with self.async_session() as session:
-                for section, items in data.items():
-                    if not isinstance(items, dict): continue
-                    for key, val in items.items():
-                        val_str = json_dumps(val)
+            params = []
+            for section, items in data.items():
+                if not isinstance(items, dict):
+                    continue
+                for key, val in items.items():
+                    params.append({"s": section, "k": key, "v": json_dumps(val)})
+            if not params:
+                return
 
-                        if self.dialect in ("mysql", "mariadb"):
-                            await session.execute(
-                                text("INSERT INTO app_config (section, key_name, value) VALUES (:s, :k, :v) "
-                                     "ON DUPLICATE KEY UPDATE value=VALUES(value)"),
-                                {"s": section, "k": key, "v": val_str}
-                            )
-                        else:
-                            await session.execute(
-                                text("INSERT INTO app_config (section, key_name, value) VALUES (:s, :k, :v) "
-                                     "ON CONFLICT (section, key_name) DO UPDATE SET value=EXCLUDED.value"),
-                                {"s": section, "k": key, "v": val_str}
-                            )
+            async with self.async_session() as session:
+                if self.dialect in ("mysql", "mariadb"):
+                    stmt = text(
+                        "INSERT INTO app_config (section, key_name, value) VALUES (:s, :k, :v) "
+                        "ON DUPLICATE KEY UPDATE value=VALUES(value)"
+                    )
+                else:
+                    stmt = text(
+                        "INSERT INTO app_config (section, key_name, value) VALUES (:s, :k, :v) "
+                        "ON CONFLICT (section, key_name) DO UPDATE SET value=EXCLUDED.value"
+                    )
+                await session.execute(stmt, params)
                 await session.commit()
         except Exception as e:
             logger.error(f"SQLStorage: 保存配置失败: {e}")
@@ -677,35 +704,37 @@ class SQLStorage(BaseStorage):
                             "updated_at": 0
                         })
 
-                # UPSERT all tokens
+                # Batch UPSERT — single executemany call instead of N round-trips
                 if params:
                     if self.dialect in ("mysql", "mariadb"):
-                        for p in params:
-                            await session.execute(
-                                text("INSERT INTO tokens (token, pool_name, data, updated_at) "
-                                     "VALUES (:token, :pool_name, :data, :updated_at) "
-                                     "ON DUPLICATE KEY UPDATE pool_name=VALUES(pool_name), "
-                                     "data=VALUES(data), updated_at=VALUES(updated_at)"),
-                                p
-                            )
+                        await session.execute(
+                            text("INSERT INTO tokens (token, pool_name, data, updated_at) "
+                                 "VALUES (:token, :pool_name, :data, :updated_at) "
+                                 "ON DUPLICATE KEY UPDATE pool_name=VALUES(pool_name), "
+                                 "data=VALUES(data), updated_at=VALUES(updated_at)"),
+                            params
+                        )
                     else:
-                        for p in params:
-                            await session.execute(
-                                text("INSERT INTO tokens (token, pool_name, data, updated_at) "
-                                     "VALUES (:token, :pool_name, :data, :updated_at) "
-                                     "ON CONFLICT (token) DO UPDATE SET pool_name=EXCLUDED.pool_name, "
-                                     "data=EXCLUDED.data, updated_at=EXCLUDED.updated_at"),
-                                p
-                            )
+                        await session.execute(
+                            text("INSERT INTO tokens (token, pool_name, data, updated_at) "
+                                 "VALUES (:token, :pool_name, :data, :updated_at) "
+                                 "ON CONFLICT (token) DO UPDATE SET pool_name=EXCLUDED.pool_name, "
+                                 "data=EXCLUDED.data, updated_at=EXCLUDED.updated_at"),
+                            params
+                        )
 
-                # Delete stale tokens no longer in the dataset
-                res = await session.execute(text("SELECT token FROM tokens"))
-                existing_keys = {row[0] for row in res.fetchall()}
-                stale_keys = existing_keys - all_token_keys
-                for key in stale_keys:
+                # Single-statement stale cleanup instead of SELECT + per-row DELETE
+                if all_token_keys:
+                    # Bind each key as a named param for safe IN clause
+                    key_params = {f"k{i}": k for i, k in enumerate(all_token_keys)}
+                    placeholders = ", ".join(f":{name}" for name in key_params)
                     await session.execute(
-                        text("DELETE FROM tokens WHERE token=:t"), {"t": key}
+                        text(f"DELETE FROM tokens WHERE token NOT IN ({placeholders})"),
+                        key_params,
                     )
+                else:
+                    # No tokens at all — wipe the table
+                    await session.execute(text("DELETE FROM tokens"))
 
                 await session.commit()
         except Exception as e:
