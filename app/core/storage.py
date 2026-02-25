@@ -492,11 +492,12 @@ class SQLStorage(BaseStorage):
         try:
             async with self.engine.begin() as conn:
                 from sqlalchemy import text
+                token_pk_type = "VARCHAR(191)" if self.dialect in ("mysql", "mariadb") else "VARCHAR(512)"
                 
                 # Tokens 表 (通用 SQL)
-                await conn.execute(text("""
+                await conn.execute(text(f"""
                     CREATE TABLE IF NOT EXISTS tokens (
-                        token VARCHAR(512) PRIMARY KEY,
+                        token {token_pk_type} PRIMARY KEY,
                         pool_name VARCHAR(64) NOT NULL,
                         data TEXT,
                         updated_at BIGINT
@@ -522,7 +523,6 @@ class SQLStorage(BaseStorage):
                 # 尝试兼容旧表结构
                 try:
                     if self.dialect in ("mysql", "mariadb"):
-                        await conn.execute(text("ALTER TABLE tokens MODIFY token VARCHAR(512)"))
                         await conn.execute(text("ALTER TABLE tokens MODIFY data TEXT"))
                     elif self.dialect in ("postgres", "postgresql", "pgsql"):
                         await conn.execute(text("ALTER TABLE tokens ALTER COLUMN token TYPE VARCHAR(512)"))
