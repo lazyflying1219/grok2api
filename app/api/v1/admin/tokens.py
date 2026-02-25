@@ -265,6 +265,31 @@ async def refresh_tokens_api(data: dict):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@router.post("/api/v1/admin/tokens/reset", dependencies=[Depends(verify_app_key)])
+async def reset_tokens_api(data: dict):
+    """重置 Token 状态（将 disabled/expired 恢复为 active）"""
+    try:
+        mgr = await get_token_manager()
+        tokens: list[str] = []
+        if "token" in data:
+            tokens.append(data["token"])
+        if "tokens" in data and isinstance(data["tokens"], list):
+            tokens.extend(data["tokens"])
+
+        if not tokens:
+            raise HTTPException(status_code=400, detail="No tokens provided")
+
+        unique_tokens = list(set(tokens))
+        results = {}
+        for t in unique_tokens:
+            results[t] = await mgr.reset_token(t)
+
+        return {"status": "success", "results": results}
+    except Exception:
+        logger.exception("Admin API error")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @router.post("/api/v1/admin/tokens/nsfw/refresh", dependencies=[Depends(verify_app_key)])
 async def refresh_tokens_nsfw_api(data: dict):
     """Refresh account settings (TOS + birth date + NSFW) for selected/all tokens."""

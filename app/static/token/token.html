@@ -59,7 +59,7 @@
       <div class="h-px bg-[var(--border)] my-6"></div>
 
       <!-- Statistics -->
-      <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6" id="stats-container">
+      <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6" id="stats-container">
         <!-- Row 1 -->
         <div class="stat-card">
           <div class="stat-value" id="stat-total">-</div>
@@ -76,6 +76,10 @@
         <div class="stat-card">
           <div class="stat-value text-red-600" id="stat-invalid">-</div>
           <div class="stat-label">Token 失效</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value text-gray-500" id="stat-disabled">-</div>
+          <div class="stat-label">Token 禁用</div>
         </div>
 
         <!-- Row 2 -->
@@ -123,6 +127,10 @@
           <label class="filter-chip">
             <input type="checkbox" id="filter-status-exhausted" onchange="onFilterChange()">
             <span>额度用尽</span>
+          </label>
+          <label class="filter-chip">
+            <input type="checkbox" id="filter-status-disabled" onchange="onFilterChange()">
+            <span>禁用</span>
           </label>
         </div>
         <div class="filter-summary ml-auto flex items-center gap-3">

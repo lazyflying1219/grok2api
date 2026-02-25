@@ -19,6 +19,7 @@ const filterState = {
   statusActive: false,
   statusInvalid: false,
   statusExhausted: false,
+  statusDisabled: false,
 };
 
 function normalizeSsoToken(token) {
@@ -91,8 +92,12 @@ function normalizeTokenRecord(pool, raw) {
   };
 }
 
+function isTokenDisabled(item) {
+  return String(item.status || '').toLowerCase() === 'disabled';
+}
+
 function isTokenInvalid(item) {
-  return ['invalid', 'expired', 'disabled'].includes(String(item.status || '').toLowerCase());
+  return ['invalid', 'expired'].includes(String(item.status || '').toLowerCase());
 }
 
 function isTokenExhausted(item) {
@@ -105,7 +110,7 @@ function isTokenExhausted(item) {
 }
 
 function isTokenActive(item) {
-  return !isTokenInvalid(item) && !isTokenExhausted(item);
+  return !isTokenInvalid(item) && !isTokenExhausted(item) && !isTokenDisabled(item);
 }
 
 function getTokenKey(token) {
@@ -127,13 +132,14 @@ function refreshFilterStateFromDom() {
   filterState.statusActive = getChecked('filter-status-active');
   filterState.statusInvalid = getChecked('filter-status-invalid');
   filterState.statusExhausted = getChecked('filter-status-exhausted');
+  filterState.statusDisabled = getChecked('filter-status-disabled');
 }
 
 function applyFilters() {
   refreshFilterStateFromDom();
 
   const hasTypeFilter = filterState.typeSso || filterState.typeSuperSso;
-  const hasStatusFilter = filterState.statusActive || filterState.statusInvalid || filterState.statusExhausted;
+  const hasStatusFilter = filterState.statusActive || filterState.statusInvalid || filterState.statusExhausted || filterState.statusDisabled;
 
   displayTokens = flatTokens.filter((item) => {
     const tokenType = String(item.token_type || poolToType(item.pool));
@@ -147,9 +153,11 @@ function applyFilters() {
     const active = isTokenActive(item);
     const invalid = isTokenInvalid(item);
     const exhausted = isTokenExhausted(item);
+    const disabled = isTokenDisabled(item);
     return (filterState.statusActive && active)
       || (filterState.statusInvalid && invalid)
-      || (filterState.statusExhausted && exhausted);
+      || (filterState.statusExhausted && exhausted)
+      || (filterState.statusDisabled && disabled);
   });
 
   const resultEl = document.getElementById('filter-result-count');
@@ -164,7 +172,7 @@ function onFilterChange() {
 }
 
 function resetFilters() {
-  ['filter-type-sso', 'filter-type-supersso', 'filter-status-active', 'filter-status-invalid', 'filter-status-exhausted']
+  ['filter-type-sso', 'filter-type-supersso', 'filter-status-active', 'filter-status-invalid', 'filter-status-exhausted', 'filter-status-disabled']
     .forEach((id) => {
       const el = document.getElementById(id);
       if (el) el.checked = false;
@@ -248,6 +256,7 @@ async function refreshStatsOnly() {
     let activeTokens = 0;
     let coolingTokens = 0;
     let invalidTokens = 0;
+    let disabledTokens = 0;
     let chatQuota = 0;
     let totalCalls = 0;
 
@@ -260,7 +269,9 @@ async function refreshStatsOnly() {
         totalTokens += 1;
         const useCount = Number(row.use_count || 0) || 0;
         totalCalls += useCount;
-        if (isTokenInvalid(row)) {
+        if (isTokenDisabled(row)) {
+          disabledTokens += 1;
+        } else if (isTokenInvalid(row)) {
           invalidTokens += 1;
         } else if (isTokenExhausted(row)) {
           coolingTokens += 1;
@@ -283,6 +294,7 @@ async function refreshStatsOnly() {
     setText('stat-active', activeTokens.toLocaleString());
     setText('stat-cooling', coolingTokens.toLocaleString());
     setText('stat-invalid', invalidTokens.toLocaleString());
+    setText('stat-disabled', disabledTokens.toLocaleString());
     setText('stat-chat-quota', chatQuota.toLocaleString());
     setText('stat-image-quota', imageQuota.toLocaleString());
     setText('stat-total-calls', totalCalls.toLocaleString());
@@ -341,11 +353,14 @@ function updateStats(data) {
   let activeTokens = 0;
   let coolingTokens = 0;
   let invalidTokens = 0;
+  let disabledTokens = 0;
   let chatQuota = 0;
   let totalCalls = 0;
 
   flatTokens.forEach(t => {
-    if (isTokenInvalid(t)) {
+    if (isTokenDisabled(t)) {
+      disabledTokens++;
+    } else if (isTokenInvalid(t)) {
       invalidTokens++;
     } else if (isTokenExhausted(t)) {
       coolingTokens++;
@@ -369,6 +384,7 @@ function updateStats(data) {
   setText('stat-active', activeTokens.toLocaleString());
   setText('stat-cooling', coolingTokens.toLocaleString());
   setText('stat-invalid', invalidTokens.toLocaleString());
+  setText('stat-disabled', disabledTokens.toLocaleString());
 
   setText('stat-chat-quota', chatQuota.toLocaleString());
   setText('stat-image-quota', imageQuota.toLocaleString());
@@ -431,11 +447,22 @@ function renderTable() {
     // Status (Center)
     const tdStatus = document.createElement('td');
     let statusClass = 'badge-gray';
-    if (isTokenActive(item)) statusClass = 'badge-green';
-    else if (isTokenExhausted(item)) statusClass = 'badge-orange';
-    else statusClass = 'badge-red';
+    let statusText = 'active';
+    if (isTokenDisabled(item)) {
+      statusClass = 'badge-gray';
+      statusText = 'disabled';
+    } else if (isTokenActive(item)) {
+      statusClass = 'badge-green';
+      statusText = 'active';
+    } else if (isTokenExhausted(item)) {
+      statusClass = 'badge-orange';
+      statusText = 'exhausted';
+    } else {
+      statusClass = 'badge-red';
+      statusText = 'invalid';
+    }
     tdStatus.className = 'text-center';
-    tdStatus.innerHTML = `<span class="badge ${statusClass}">${isTokenActive(item) ? 'active' : (isTokenExhausted(item) ? 'exhausted' : 'invalid')}</span>`;
+    tdStatus.innerHTML = `<span class="badge ${statusClass}">${statusText}</span>`;
 
     // Quota (Center)
     const tdQuota = document.createElement('td');
@@ -450,11 +477,15 @@ function renderTable() {
     // Actions (Center)
     const tdActions = document.createElement('td');
     tdActions.className = 'text-center';
+    const resetBtn = isTokenDisabled(item) ? `
+                     <button onclick="resetToken(decodeURIComponent('${tokenEncoded}'), this)" class="p-1 text-gray-400 hover:text-green-600 rounded" title="恢复">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path><path d="M3 3v5h5"></path></svg>
+                     </button>` : '';
     tdActions.innerHTML = `
                 <div class="flex items-center justify-center gap-2">
                      <button onclick="refreshStatus(decodeURIComponent('${tokenEncoded}'), this)" class="p-1 text-gray-400 hover:text-black rounded" title="刷新状态">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
-                     </button>
+                     </button>${resetBtn}
                      <button onclick="openEditModalByKey(decodeURIComponent('${tokenKeyEncoded}'))" class="p-1 text-gray-400 hover:text-black rounded" title="编辑">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
                      </button>
@@ -889,6 +920,43 @@ async function refreshStatus(token, btnEl) {
       }
     } else {
       showToast(extractApiErrorMessage(data, '刷新失败'), 'error');
+    }
+  } catch (e) {
+    console.error(e);
+    showToast(e?.message ? `请求错误: ${e.message}` : '请求错误', 'error');
+  }
+}
+
+async function resetToken(token, btnEl) {
+  try {
+    const btn = btnEl || null;
+    if (btn) {
+      btn.innerHTML = `<svg class="animate-spin" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.219-8.56"></path></svg>`;
+    }
+
+    const normalized = normalizeSsoToken(token);
+    const res = await fetch('/api/v1/admin/tokens/reset', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildAuthHeaders(apiKey)
+      },
+      body: JSON.stringify({ token: normalized })
+    });
+
+    const data = await parseJsonSafely(res);
+
+    if (res.ok && data && data.status === 'success') {
+      const isSuccess = Boolean(data.results[normalized] ?? data.results[`sso=${normalized}`]);
+      loadData();
+
+      if (isSuccess) {
+        showToast('恢复成功', 'success');
+      } else {
+        showToast('恢复失败：Token 未找到', 'error');
+      }
+    } else {
+      showToast(extractApiErrorMessage(data, '恢复失败'), 'error');
     }
   } catch (e) {
     console.error(e);

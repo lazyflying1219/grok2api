@@ -30,7 +30,7 @@ def test_auth_fail_marks_token_unavailable_and_warning_logs_full_token(monkeypat
             logger.remove(sink_id)
 
         assert ok is True
-        assert token_info.status == TokenStatus.EXPIRED
+        assert token_info.status == TokenStatus.DISABLED
         assert token_info.fail_count == FAIL_THRESHOLD
         assert any(token_value in msg for msg in warning_messages)
 

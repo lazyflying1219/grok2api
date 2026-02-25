@@ -573,13 +573,13 @@ class TokenManager:
             if token:
                 token.record_fail(status_code, reason)
                 if status_code in (401, 403):
-                    token.status = TokenStatus.EXPIRED
+                    token.status = TokenStatus.DISABLED
                     token.fail_count = max(token.fail_count, FAIL_THRESHOLD)
                     token.last_fail_at = _now_ms()
                     token.last_fail_reason = reason
                     logger.warning(
                         f"Token {raw_token}: auth failure ({status_code}), "
-                        f"marked unavailable ({token.fail_count}/{FAIL_THRESHOLD}) - {reason}"
+                        f"marked disabled ({token.fail_count}/{FAIL_THRESHOLD}) - {reason}"
                     )
                 else:
                     logger.info(
@@ -630,13 +630,13 @@ class TokenManager:
         return False
 
     async def set_token_invalid(self, token_str: str, reason: str = "", save: bool = True) -> bool:
-        """Mark a token as expired/invalid."""
+        """Mark a token as disabled/invalid."""
         token, raw_token = self._find_token_info(token_str)
         if not token:
             logger.warning(f"Token {raw_token}: not found for invalidation")
             return False
 
-        token.status = TokenStatus.EXPIRED
+        token.status = TokenStatus.DISABLED
         token.fail_count = max(token.fail_count, FAIL_THRESHOLD)
         token.last_fail_at = _now_ms()
         if reason:
@@ -818,12 +818,12 @@ class TokenManager:
                                 await asyncio.sleep(0.5)
                                 continue
                             else:
-                                # 重试 2 次后仍然 401，标记为 expired
+                                # 重试 2 次后仍然 401，标记为 disabled
                                 logger.error(
                                     f"Token {token_info.token[:10]}...: 401 after 2 retries, "
-                                    f"marking as expired"
+                                    f"marking as disabled"
                                 )
-                                token_info.status = TokenStatus.EXPIRED
+                                token_info.status = TokenStatus.DISABLED
                                 token_info.mark_synced()
                                 return {"recovered": False, "expired": True}
                         else:

@@ -79,43 +79,51 @@ class TokenInfo(BaseModel):
     def consume(self, effort: EffortType = EffortType.LOW) -> int:
         """
         消耗配额
-        
+
         Args:
             effort: LOW 扣 1，HIGH 扣 4
-            
+
         Returns:
             实际扣除的配额
         """
         cost = EFFORT_COST[effort]
         actual_cost = min(cost, self.quota)
-        
+
         self.last_used_at = _now_ms()
         self.use_count += 1
         self.quota = max(0, self.quota - cost)
-        
+
+        # DISABLED 状态不可通过正常操作恢复（需管理员手动 reset）
+        if self.status == TokenStatus.DISABLED:
+            return actual_cost
+
         # 成功消耗后清空失败计数
         self.fail_count = 0
         self.last_fail_reason = None
-        
+
         if self.quota == 0:
             self.status = TokenStatus.COOLING
-        elif self.status in [TokenStatus.COOLING, TokenStatus.EXPIRED]:
+        elif self.status == TokenStatus.COOLING:
             self.status = TokenStatus.ACTIVE
-            
+
         return actual_cost
     
     def update_quota(self, new_quota: int):
         """
         更新配额（用于 API 同步）
-        
+
         Args:
             new_quota: 新的配额值
         """
         self.quota = max(0, new_quota)
-        
+
+        # DISABLED 状态不可通过 quota 同步恢复
+        if self.status == TokenStatus.DISABLED:
+            return
+
         if self.quota == 0:
             self.status = TokenStatus.COOLING
-        elif self.quota > 0 and self.status in [TokenStatus.COOLING, TokenStatus.EXPIRED]:
+        elif self.quota > 0 and self.status == TokenStatus.COOLING:
             self.status = TokenStatus.ACTIVE
 
     def update_heavy_quota(self, new_quota: int):
@@ -161,7 +169,7 @@ class TokenInfo(BaseModel):
         self.last_fail_reason = None
     
     def record_fail(self, status_code: int = 401, reason: str = ""):
-        """记录失败，达到阈值后自动标记为 expired"""
+        """记录失败，达到阈值后标记为 disabled（不可自动恢复）"""
         # 401/403 计入失败（token 无效或被封禁）
         if status_code not in (401, 403):
             return
@@ -171,18 +179,22 @@ class TokenInfo(BaseModel):
         self.last_fail_reason = reason
 
         if self.fail_count >= FAIL_THRESHOLD:
-            self.status = TokenStatus.EXPIRED
+            self.status = TokenStatus.DISABLED
     
     def record_success(self, is_usage: bool = True):
         """记录成功，清空失败计数并根据配额更新状态"""
+        # DISABLED 状态不可通过成功请求恢复
+        if self.status == TokenStatus.DISABLED:
+            return
+
         self.fail_count = 0
         self.last_fail_at = None
         self.last_fail_reason = None
-        
+
         if is_usage:
             self.use_count += 1
             self.last_used_at = _now_ms()
-        
+
         if self.quota == 0:
             self.status = TokenStatus.COOLING
         else:
