@@ -513,12 +513,26 @@ class SQLStorage(BaseStorage):
     async def _ensure_schema(self):
         """确保数据库表存在"""
         if self._initialized: return
+        from sqlalchemy import text
+
+        # Fast path: single query probes both tables in one roundtrip
+        try:
+            async with self.engine.connect() as conn:
+                await conn.execute(text(
+                    "SELECT 1 FROM tokens WHERE 1=0 "
+                    "UNION ALL "
+                    "SELECT 1 FROM app_config WHERE 1=0"
+                ))
+            self._initialized = True
+            return
+        except Exception:
+            pass
+
+        # Slow path: full DDL — only runs on first-ever startup
         try:
             async with self.engine.begin() as conn:
-                from sqlalchemy import text
                 token_pk_type = "VARCHAR(191)" if self.dialect in ("mysql", "mariadb") else "VARCHAR(512)"
-                
-                # Tokens 表 (通用 SQL)
+
                 await conn.execute(text(f"""
                     CREATE TABLE IF NOT EXISTS tokens (
                         token {token_pk_type} PRIMARY KEY,
@@ -527,8 +541,7 @@ class SQLStorage(BaseStorage):
                         updated_at BIGINT
                     )
                 """))
-                
-                # 配置表
+
                 await conn.execute(text("""
                     CREATE TABLE IF NOT EXISTS app_config (
                         section VARCHAR(64) NOT NULL,
@@ -537,14 +550,12 @@ class SQLStorage(BaseStorage):
                         PRIMARY KEY (section, key_name)
                     )
                 """))
-                
-                # 索引
+
                 try:
                     await conn.execute(text("CREATE INDEX idx_tokens_pool ON tokens (pool_name)"))
                 except Exception:
                     pass
 
-                # 尝试兼容旧表结构
                 try:
                     if self.dialect in ("mysql", "mariadb"):
                         await conn.execute(text("ALTER TABLE tokens MODIFY data TEXT"))
@@ -553,7 +564,7 @@ class SQLStorage(BaseStorage):
                         await conn.execute(text("ALTER TABLE tokens ALTER COLUMN data TYPE TEXT"))
                 except Exception:
                     pass
-                    
+
             self._initialized = True
         except Exception as e:
             logger.error(f"SQLStorage: Schema 初始化失败: {e}")
@@ -641,18 +652,38 @@ class SQLStorage(BaseStorage):
             if not params:
                 return
 
+            # Build single multi-row INSERT to avoid N roundtrips from executemany
+            flat = {}
+            placeholders = []
+            for i, p in enumerate(params):
+                flat[f"s{i}"] = p["s"]
+                flat[f"k{i}"] = p["k"]
+                flat[f"v{i}"] = p["v"]
+                placeholders.append(f"(:s{i}, :k{i}, :v{i})")
+            values_clause = ", ".join(placeholders)
+
             async with self.async_session() as session:
                 if self.dialect in ("mysql", "mariadb"):
                     stmt = text(
-                        "INSERT INTO app_config (section, key_name, value) VALUES (:s, :k, :v) "
+                        f"INSERT INTO app_config (section, key_name, value) VALUES {values_clause} "
                         "ON DUPLICATE KEY UPDATE value=VALUES(value)"
                     )
                 else:
                     stmt = text(
-                        "INSERT INTO app_config (section, key_name, value) VALUES (:s, :k, :v) "
+                        f"INSERT INTO app_config (section, key_name, value) VALUES {values_clause} "
                         "ON CONFLICT (section, key_name) DO UPDATE SET value=EXCLUDED.value"
                     )
-                await session.execute(stmt, params)
+                await session.execute(stmt, flat)
+
+                # Clean up stale sections no longer in current config
+                sections = {p["s"] for p in params}
+                sec_params = {f"sec{i}": s for i, s in enumerate(sections)}
+                sec_placeholders = ", ".join(f":{n}" for n in sec_params)
+                await session.execute(
+                    text(f"DELETE FROM app_config WHERE section NOT IN ({sec_placeholders})"),
+                    sec_params,
+                )
+
                 await session.commit()
         except Exception as e:
             logger.error(f"SQLStorage: 保存配置失败: {e}")

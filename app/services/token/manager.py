@@ -128,7 +128,7 @@ class TokenManager:
             await self._load()
 
     async def reload_if_stale(self):
-        """在多 worker 场景下保持短周期一致性"""
+        """在多 worker 场景下保持短周期一致性（后台刷新，不阻塞请求）"""
         interval = get_config("token.reload_interval_sec", 30)
         try:
             interval = float(interval)
@@ -138,7 +138,19 @@ class TokenManager:
             return
         if time.monotonic() - self._last_reload_at < interval:
             return
-        await self.reload()
+        # Mark reload time immediately to prevent stampede
+        self._last_reload_at = time.monotonic()
+        asyncio.create_task(self._background_reload())
+
+    async def _background_reload(self):
+        """Background reload that doesn't block request hot path."""
+        try:
+            await self.reload()
+        except Exception as e:
+            logger.warning(f"Background token reload failed: {e}")
+
+    # Runtime-only fields excluded from DB persistence (they're meaningless after restart)
+    _RUNTIME_ONLY_FIELDS = frozenset({"inflight_until", "inflight_request_id"})
 
     async def _save(self):
         """保存变更"""
@@ -147,9 +159,10 @@ class TokenManager:
                 data = {}
                 for pool_name, pool in self.pools.items():
                     data[pool_name] = [
-                        info.model_dump() for info in pool.list()
+                        {k: v for k, v in info.model_dump().items() if k not in self._RUNTIME_ONLY_FIELDS}
+                        for info in pool.list()
                     ]
-                
+
                 storage = get_storage()
                 async with storage.acquire_lock("tokens_save", timeout=10):
                     await storage.save_tokens(data)
@@ -294,7 +307,6 @@ class TokenManager:
                 break
 
         if selected_token is not None:
-            self._schedule_save()
             return selected_token[4:] if selected_token.startswith("sso=") else selected_token, request_id
 
         return None, None
@@ -324,16 +336,12 @@ class TokenManager:
             if current_until <= now_ms:
                 token.inflight_until = 0
                 token.inflight_request_id = None
-                need_save = True
             elif current_request_id != request_id:
                 return False
             else:
                 token.inflight_until = 0
                 token.inflight_request_id = None
-                need_save = True
 
-        if need_save:
-            self._schedule_save()
         return True
 
     def get_token(self, pool_name: str = "ssoBasic") -> Optional[str]:

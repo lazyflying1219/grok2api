@@ -36,7 +36,9 @@ class ApiKeyManager:
         self._usage: Dict[str, Dict[str, Dict[str, int]]] = {}
         self._usage_lock = asyncio.Lock()
         self._usage_loaded = False
-        
+        self._usage_dirty = False
+        self._usage_save_task: Optional[asyncio.Task] = None
+
         self._initialized = True
         logger.debug(f"[ApiKey] 初始化完成: {self.file_path}")
 
@@ -178,6 +180,21 @@ class ApiKeyManager:
                 await asyncio.to_thread(self.usage_path.write_bytes, content)
         except Exception as e:
             logger.error(f"[ApiKey] Usage 保存失败: {e}")
+
+    def _schedule_usage_save(self):
+        """Debounced usage save — coalesce rapid writes into a single file write."""
+        self._usage_dirty = True
+        if self._usage_save_task and not self._usage_save_task.done():
+            return
+        self._usage_save_task = asyncio.create_task(self._usage_flush_loop())
+
+    async def _usage_flush_loop(self):
+        while True:
+            await asyncio.sleep(0.5)
+            if not self._usage_dirty:
+                break
+            self._usage_dirty = False
+            await self._save_usage_data()
 
     def generate_key(self) -> str:
         """生成一个新的 sk- 开头的 key"""
@@ -399,7 +416,7 @@ class ApiKeyManager:
                 usage[bucket] = int(usage.get(bucket, 0) or 0) + inc
             usage["updated_at"] = at_ms
 
-        await self._save_usage_data()
+        self._schedule_usage_save()
         return True
 
     def validate_key(self, key: str) -> Optional[Dict]:

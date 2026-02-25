@@ -271,6 +271,12 @@ class Config:
 
             merged = _deep_merge(self._defaults, config_data)
 
+            # Strip stale sections no longer in defaults (e.g. removed features)
+            stale = [s for s in merged if s not in self._defaults]
+            for s in stale:
+                del merged[s]
+                logger.info(f"Removed stale config section: [{s}]")
+
             # 自动回填缺失配置到存储
             should_persist = (not from_remote) or (merged != before_legacy)
             if should_persist:
