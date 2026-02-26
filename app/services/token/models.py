@@ -8,7 +8,7 @@ Token 数据模型
 """
 
 from enum import Enum
-from typing import Optional, List
+from typing import Dict, Optional, List
 from pydantic import BaseModel, Field
 import time
 
@@ -51,8 +51,7 @@ class TokenInfo(BaseModel):
     status: TokenStatus = TokenStatus.ACTIVE
     quota: int = DEFAULT_QUOTA
     heavy_quota: int = -1
-    inflight_until: int = 0
-    inflight_request_id: Optional[str] = None
+    inflight_map: Dict[str, int] = Field(default_factory=dict)  # request_id → expire_ts (runtime only)
     
     # 统计
     created_at: int = Field(default_factory=_now_ms)

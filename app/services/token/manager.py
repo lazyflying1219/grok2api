@@ -150,7 +150,7 @@ class TokenManager:
             logger.warning(f"Background token reload failed: {e}")
 
     # Runtime-only fields excluded from DB persistence (they're meaningless after restart)
-    _RUNTIME_ONLY_FIELDS = frozenset({"inflight_until", "inflight_request_id"})
+    _RUNTIME_ONLY_FIELDS = frozenset({"inflight_map"})
 
     async def _save(self):
         """保存变更"""
@@ -271,13 +271,21 @@ class TokenManager:
             value = 180000
         return max(1000, value)
 
+    def _max_concurrent_per_token(self) -> int:
+        value = get_config("token.max_concurrent_per_token", 0)
+        try:
+            value = int(value)
+        except Exception:
+            value = 0
+        return max(0, value)
+
     async def reserve_token_for_model(
         self,
         model_id: str,
         exclude: Optional[set] = None,
     ) -> tuple[Optional[str], Optional[str]]:
         """
-        为请求预占一个 Token（跨 worker 原子）。
+        为请求预占一个 Token（支持同一 token 多并发）。
 
         返回:
             (token, request_id)；若无可用 token，返回 (None, None)
@@ -288,6 +296,7 @@ class TokenManager:
         ttl_ms = self._reserve_ttl_ms()
         request_id = uuid.uuid4().hex
         excluded = set(exclude or set())
+        max_concurrent = self._max_concurrent_per_token()
 
         selected_token = None
         async with self._select_lock:
@@ -297,12 +306,14 @@ class TokenManager:
                 if not pool:
                     continue
 
-                token_info = pool.select(bucket=bucket, exclude=excluded, now_ms=now_ms)
+                token_info = pool.select(
+                    bucket=bucket, exclude=excluded,
+                    now_ms=now_ms, max_concurrent=max_concurrent,
+                )
                 if not token_info:
                     continue
 
-                token_info.inflight_until = now_ms + ttl_ms
-                token_info.inflight_request_id = request_id
+                token_info.inflight_map[request_id] = now_ms + ttl_ms
                 selected_token = token_info.token
                 break
 
@@ -316,7 +327,7 @@ class TokenManager:
         token_str: str,
         request_id: Optional[str],
     ) -> bool:
-        """释放预占；request_id 不匹配时不释放，避免误释放其他请求。"""
+        """释放预占；按 request_id 精确移除，不影响同一 token 的其他预占。"""
         if not request_id:
             return False
 
@@ -329,20 +340,7 @@ class TokenManager:
             if not token:
                 return False
 
-            now_ms = _now_ms()
-            current_until = int(getattr(token, "inflight_until", 0) or 0)
-            current_request_id = getattr(token, "inflight_request_id", None)
-
-            if current_until <= now_ms:
-                token.inflight_until = 0
-                token.inflight_request_id = None
-            elif current_request_id != request_id:
-                return False
-            else:
-                token.inflight_until = 0
-                token.inflight_request_id = None
-
-        return True
+            return token.inflight_map.pop(request_id, None) is not None
 
     def get_token(self, pool_name: str = "ssoBasic") -> Optional[str]:
         """
