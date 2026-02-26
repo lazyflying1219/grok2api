@@ -16,6 +16,7 @@ from app.services.token.account_settings import (
     normalize_sso_token as normalize_refresh_token,
 )
 from app.services.token import get_token_manager
+from app.services.token.models import TokenStatus
 from app.api.v1.admin.common import _safe_int
 
 router = APIRouter()
@@ -248,16 +249,25 @@ async def refresh_tokens_api(data: dict):
 
         async def _refresh_one(t):
             async with sem:
-                return t, await mgr.sync_usage(
+                ok = await mgr.sync_usage(
                     t,
                     "grok-3",
                     consume_on_fail=False,
                     is_usage=False,
                     retry=False,
                 )
+                if ok:
+                    token_info, _ = mgr._find_token_info(t)
+                    if token_info and token_info.status != TokenStatus.ACTIVE:
+                        token_info.status = TokenStatus.ACTIVE
+                return t, ok
 
         results_list = await asyncio.gather(*[_refresh_one(t) for t in unique_tokens])
         results = dict(results_list)
+
+        any_changed = any(results.values())
+        if any_changed:
+            mgr._schedule_save()
 
         return {"status": "success", "results": results}
     except Exception:

@@ -27,6 +27,7 @@ from app.core.config import get_config
 from app.core.logger import logger, setup_logging
 from app.core.exceptions import register_exception_handlers
 from app.core.response_middleware import ResponseLoggerMiddleware
+from app.core.compression import CompressionMiddleware
 from app.api.v1.chat import router as chat_router
 from app.api.v1.image import router as image_router
 from app.api.v1.files import router as files_router
@@ -141,6 +142,9 @@ def create_app() -> FastAPI:
 
     # 请求日志和 ID 中间件
     app.add_middleware(ResponseLoggerMiddleware)
+
+    # 响应压缩 (zstd > gzip, 自动跳过 SSE 流)
+    app.add_middleware(CompressionMiddleware)
 
     # 注册异常处理器
     register_exception_handlers(app)
