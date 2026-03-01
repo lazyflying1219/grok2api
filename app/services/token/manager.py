@@ -195,6 +195,24 @@ class TokenManager:
             self._dirty = False
             await self._save()
 
+    async def cancel_pending_save(self):
+        """Cancel any scheduled/in-progress background save and wait for it to finish.
+
+        Call this before acquiring the storage lock externally (e.g. admin
+        token-update endpoint) to avoid competing with the background save for
+        the same MySQL GET_LOCK.
+        """
+        self._dirty = False
+        task = self._save_task
+        if task and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        self._save_task = None
+        # Ensure no _save() is mid-flight behind the asyncio lock
+        async with self._save_lock:
+            pass
+
     async def close(self, flush: bool = True):
         """关闭后台任务并可选落盘，供进程退出时调用。"""
         task = self._save_task

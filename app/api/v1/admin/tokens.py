@@ -193,7 +193,10 @@ async def update_tokens_api(data: dict):
         existing_tokens: list[str] = []
         added_tokens: list[str] = []
 
-        async with storage.acquire_lock("tokens_save", timeout=10):
+        # Cancel any background save to avoid competing for the same MySQL lock.
+        await mgr.cancel_pending_save()
+
+        async with storage.acquire_lock("tokens_save", timeout=30):
             old_data = await storage.load_tokens()
             existing_tokens = _collect_tokens_from_pool_payload(
                 old_data if isinstance(old_data, dict) else {}
