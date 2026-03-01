@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import type { Env } from "../env";
 import { requireApiAuth } from "../auth";
+import type { SettingsBundle } from "../settings";
 import { getSettings, normalizeCfCookie } from "../settings";
 import { isValidModel, MODEL_CONFIG, getModelInfo, normalizeModelId } from "../grok/models";
 import { extractContent, buildConversationPayload, sendConversationRequest } from "../grok/conversation";
@@ -17,9 +18,9 @@ import {
   sendExperimentalImageEditRequest,
 } from "../grok/imagineExperimental";
 import { addRequestLog } from "../repo/logs";
-import { applyCooldown, recordTokenFailure, selectBestToken } from "../repo/tokens";
+import { recordFailureAndCooldown, selectBestToken } from "../repo/tokens";
 import type { ApiAuthInfo } from "../auth";
-import { getApiKeyLimits } from "../repo/apiKeys";
+import type { ApiKeyLimits } from "../repo/apiKeys";
 import { localDayString, tryConsumeDailyUsage } from "../repo/apiKeyUsage";
 import { nextLocalMidnightExpirationSeconds } from "../kv/cleanup";
 import { nowMs } from "../utils/time";
@@ -80,7 +81,7 @@ async function runTasksSettledWithLimit<T, R>(
   return results;
 }
 
-export const openAiRoutes = new Hono<{ Bindings: Env; Variables: { apiAuth: ApiAuthInfo } }>();
+export const openAiRoutes = new Hono<{ Bindings: Env; Variables: { apiAuth: ApiAuthInfo; settings: SettingsBundle } }>();
 
 openAiRoutes.use(
   "/*",
@@ -119,12 +120,13 @@ async function enforceQuota(args: {
   model: string;
   kind: "chat" | "image" | "video";
   imageCount?: number;
+  limits?: ApiKeyLimits | null;
 }): Promise<{ ok: true } | { ok: false; resp: Response }> {
   const key = args.apiAuth.key;
   if (!key) return { ok: true };
   if (args.apiAuth.is_admin) return { ok: true };
 
-  const limits = await getApiKeyLimits(args.env.DB, key);
+  const limits = args.limits !== undefined ? args.limits : args.apiAuth.limits ?? null;
   if (!limits) return { ok: true };
 
   const tz = parseIntSafe(args.env.CACHE_RESET_TZ_OFFSET_MINUTES, 480);
@@ -1167,7 +1169,7 @@ openAiRoutes.get("/models/:modelId", async (c) => {
 });
 
 openAiRoutes.get("/images/method", async (c) => {
-  const settingsBundle = await getSettings(c.env);
+  const settingsBundle = c.get("settings");
   return c.json({ image_generation_method: imageGenerationMethod(settingsBundle) });
 });
 
@@ -1199,7 +1201,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
       return c.json(openAiError(`Model '${requestedModel}' not supported`, "model_not_supported"), 400);
     requestedModel = normalizeModelId(requestedModel);
 
-    const settingsBundle = await getSettings(c.env);
+    const settingsBundle = c.get("settings");
     const cfg = getModelInfo(requestedModel)!;
 
     const stream = Boolean(body.stream);
@@ -1220,15 +1222,18 @@ openAiRoutes.post("/chat/completions", async (c) => {
     });
     if (!quota.ok) return quota.resp;
 
+    // Pre-compute content extraction and prompt tokens outside retry loop
+    const { content, images } = extractContent(body.messages as any);
+    const promptTokens = countPromptTokens(body.messages as unknown[]);
+    const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
+
     for (let attempt = 0; attempt < maxRetry; attempt++) {
       const chosen = await selectBestToken(c.env.DB, requestedModel);
       if (!chosen) return c.json(openAiError("No available token", "NO_AVAILABLE_TOKEN"), 503);
 
       const jwt = chosen.token;
-      const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
       const cookie = cf ? `sso-rw=${jwt};sso=${jwt};${cf}` : `sso-rw=${jwt};sso=${jwt}`;
 
-      const { content, images } = extractContent(body.messages as any);
       const isVideoModel = Boolean(cfg.is_video_model);
       const imgInputs = isVideoModel && images.length > 1 ? images.slice(0, 1) : images;
 
@@ -1272,14 +1277,12 @@ openAiRoutes.post("/chat/completions", async (c) => {
         if (!upstream.ok) {
           const txt = await upstream.text().catch(() => "");
           lastErr = `Upstream ${upstream.status}: ${txt.slice(0, 200)}`;
-          await recordTokenFailure(c.env.DB, jwt, upstream.status, txt.slice(0, 200));
-          await applyCooldown(c.env.DB, jwt, upstream.status);
+          c.executionCtx.waitUntil(recordFailureAndCooldown(c.env.DB, jwt, upstream.status, txt.slice(0, 200)));
           // Chat 请求只要上游非 200 就切换 token 重试，避免白名单漏掉 key 相关错误。
           if (attempt < maxRetry - 1) continue;
           break;
         }
 
-        const promptTokens = countPromptTokens(body.messages as unknown[]);
 
         if (stream) {
           const sse = createOpenAiStreamFromGrokNdjson(upstream, {
@@ -1288,8 +1291,8 @@ openAiRoutes.post("/chat/completions", async (c) => {
             global: settingsBundle.global,
             origin,
             promptTokens,
-            onFinish: async ({ status, duration }) => {
-              await addRequestLog(c.env.DB, {
+            onFinish: ({ status, duration }) => {
+              c.executionCtx.waitUntil(addRequestLog(c.env.DB, {
                 ip,
                 model: requestedModel,
                 duration: Number(duration.toFixed(2)),
@@ -1297,7 +1300,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
                 key_name: keyName,
                 token_suffix: jwt.slice(-6),
                 error: status === 200 ? "" : "stream_error",
-              });
+              }));
             },
           });
 
@@ -1323,7 +1326,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
         });
 
         const duration = (Date.now() - start) / 1000;
-        await addRequestLog(c.env.DB, {
+        c.executionCtx.waitUntil(addRequestLog(c.env.DB, {
           ip,
           model: requestedModel,
           duration: Number(duration.toFixed(2)),
@@ -1331,20 +1334,19 @@ openAiRoutes.post("/chat/completions", async (c) => {
           key_name: keyName,
           token_suffix: jwt.slice(-6),
           error: "",
-        });
+        }));
 
         return c.json(json);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         lastErr = msg;
-        await recordTokenFailure(c.env.DB, jwt, 500, msg);
-        await applyCooldown(c.env.DB, jwt, 500);
+        c.executionCtx.waitUntil(recordFailureAndCooldown(c.env.DB, jwt, 500, msg));
         if (attempt < maxRetry - 1) continue;
       }
     }
 
     const duration = (Date.now() - start) / 1000;
-    await addRequestLog(c.env.DB, {
+    c.executionCtx.waitUntil(addRequestLog(c.env.DB, {
       ip,
       model: requestedModel,
       duration: Number(duration.toFixed(2)),
@@ -1352,12 +1354,12 @@ openAiRoutes.post("/chat/completions", async (c) => {
       key_name: keyName,
       token_suffix: "",
       error: lastErr ?? "unknown_error",
-    });
+    }));
 
     return c.json(openAiError(lastErr ?? "Upstream error", "upstream_error"), 500);
   } catch (e) {
     const duration = (Date.now() - start) / 1000;
-    await addRequestLog(c.env.DB, {
+    c.executionCtx.waitUntil(addRequestLog(c.env.DB, {
       ip,
       model: requestedModel || "unknown",
       duration: Number(duration.toFixed(2)),
@@ -1365,7 +1367,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
       key_name: keyName,
       token_suffix: "",
       error: e instanceof Error ? e.message : String(e),
-    });
+    }));
     return c.json(openAiError("Internal error", "internal_error"), 500);
   }
 });
@@ -1411,7 +1413,7 @@ openAiRoutes.post("/images/generations", async (c) => {
       return c.json(openAiError(invalidStreamNMessage(), "invalid_stream_n"), 400);
     }
 
-    const settingsBundle = await getSettings(c.env);
+    const settingsBundle = c.get("settings");
     const imageMethod = imageGenerationMethod(settingsBundle);
     const parsedResponseFormat = resolveImageResponseFormatByMethodOrError(
       body.response_format,
@@ -1453,8 +1455,8 @@ openAiRoutes.post("/images/generations", async (c) => {
             baseUrl,
             aspectRatio,
             concurrency,
-            onFinish: async ({ status, duration }) => {
-              await addRequestLog(c.env.DB, {
+            onFinish: ({ status, duration }) => {
+              c.executionCtx.waitUntil(addRequestLog(c.env.DB, {
                 ip,
                 model: requestedModel,
                 duration: Number(duration.toFixed(2)),
@@ -1462,7 +1464,7 @@ openAiRoutes.post("/images/generations", async (c) => {
                 key_name: keyName,
                 token_suffix: getTokenSuffix(experimentalToken.token),
                 error: status === 200 ? "" : "stream_error",
-              });
+              }));
             },
           });
           return new Response(streamBody, { status: 200, headers: streamHeaders() });
@@ -1471,7 +1473,7 @@ openAiRoutes.post("/images/generations", async (c) => {
 
       const chosen = await selectBestToken(c.env.DB, requestedModel);
       if (!chosen) {
-        await recordImageLog({
+        c.executionCtx.waitUntil(recordImageLog({
           env: c.env,
           ip,
           model: requestedModel,
@@ -1479,7 +1481,7 @@ openAiRoutes.post("/images/generations", async (c) => {
           keyName,
           status: 503,
           error: "NO_AVAILABLE_TOKEN",
-        });
+        }));
         return new Response(
           createStreamErrorImageEventStream({
             message: "No available token",
@@ -1499,18 +1501,21 @@ openAiRoutes.post("/images/generations", async (c) => {
       });
       if (!upstream.ok) {
         const txt = await upstream.text().catch(() => "");
-        await recordTokenFailure(c.env.DB, chosen.token, upstream.status, txt.slice(0, 200));
-        await applyCooldown(c.env.DB, chosen.token, upstream.status);
-        await recordImageLog({
-          env: c.env,
-          ip,
-          model: requestedModel,
-          start,
-          keyName,
-          status: upstream.status,
-          tokenSuffix: getTokenSuffix(chosen.token),
-          error: txt.slice(0, 200),
-        });
+        c.executionCtx.waitUntil(
+          Promise.all([
+            recordFailureAndCooldown(c.env.DB, chosen.token, upstream.status, txt.slice(0, 200)),
+            recordImageLog({
+              env: c.env,
+              ip,
+              model: requestedModel,
+              start,
+              keyName,
+              status: upstream.status,
+              tokenSuffix: getTokenSuffix(chosen.token),
+              error: txt.slice(0, 200),
+            }),
+          ]),
+        );
         return new Response(
           createStreamErrorImageEventStream({
             message: isContentModerationMessage(txt)
@@ -1529,8 +1534,8 @@ openAiRoutes.post("/images/generations", async (c) => {
         cookie,
         settings: settingsBundle.grok,
         n,
-        onFinish: async ({ status, duration }) => {
-          await addRequestLog(c.env.DB, {
+        onFinish: ({ status, duration }) => {
+          c.executionCtx.waitUntil(addRequestLog(c.env.DB, {
             ip,
             model: requestedModel,
             duration: Number(duration.toFixed(2)),
@@ -1538,7 +1543,7 @@ openAiRoutes.post("/images/generations", async (c) => {
             key_name: keyName,
             token_suffix: getTokenSuffix(chosen.token),
             error: status === 200 ? "" : "stream_error",
-          });
+          }));
         },
       });
       return new Response(streamBody, { status: 200, headers: streamHeaders() });
@@ -1560,7 +1565,7 @@ openAiRoutes.post("/images/generations", async (c) => {
             concurrency,
           });
           const selected = pickImageResults(urls, n);
-          await recordImageLog({
+          c.executionCtx.waitUntil(recordImageLog({
             env: c.env,
             ip,
             model: requestedModel,
@@ -1569,12 +1574,11 @@ openAiRoutes.post("/images/generations", async (c) => {
             status: 200,
             tokenSuffix: getTokenSuffix(experimentalToken.token),
             error: "",
-          });
+          }));
           return c.json(buildImageJsonPayload(responseField, selected));
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
-          await recordTokenFailure(c.env.DB, experimentalToken.token, 500, msg.slice(0, 200));
-          await applyCooldown(c.env.DB, experimentalToken.token, 500);
+          c.executionCtx.waitUntil(recordFailureAndCooldown(c.env.DB, experimentalToken.token, 500, msg.slice(0, 200)));
           console.warn("Experimental image generation failed, fallback to legacy:", msg);
         }
       }
@@ -1600,8 +1604,7 @@ openAiRoutes.post("/images/generations", async (c) => {
         });
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        await recordTokenFailure(c.env.DB, chosen.token, 500, msg.slice(0, 200));
-        await applyCooldown(c.env.DB, chosen.token, 500);
+        c.executionCtx.waitUntil(recordFailureAndCooldown(c.env.DB, chosen.token, 500, msg.slice(0, 200)));
         throw e;
       }
     },
@@ -1609,7 +1612,7 @@ openAiRoutes.post("/images/generations", async (c) => {
     const urls = dedupeImages(urlsNested.flat().filter(Boolean));
     const selected = pickImageResults(urls, n);
 
-    await recordImageLog({
+    c.executionCtx.waitUntil(recordImageLog({
       env: c.env,
       ip,
       model: requestedModel,
@@ -1617,13 +1620,13 @@ openAiRoutes.post("/images/generations", async (c) => {
       keyName,
       status: 200,
       error: "",
-    });
+    }));
 
     return c.json(buildImageJsonPayload(responseField, selected));
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     if (isContentModerationMessage(message)) {
-      await recordImageLog({
+      c.executionCtx.waitUntil(recordImageLog({
         env: c.env,
         ip,
         model: requestedModel || "image",
@@ -1631,10 +1634,10 @@ openAiRoutes.post("/images/generations", async (c) => {
         keyName,
         status: 400,
         error: message,
-      });
+      }));
       return c.json(openAiError(message, "content_policy_violation"), 400);
     }
-    await recordImageLog({
+    c.executionCtx.waitUntil(recordImageLog({
       env: c.env,
       ip,
       model: requestedModel || "image",
@@ -1642,7 +1645,7 @@ openAiRoutes.post("/images/generations", async (c) => {
       keyName,
       status: 500,
       error: message,
-    });
+    }));
     return c.json(openAiError(message || "Internal error", "internal_error"), 500);
   }
 });
@@ -1677,7 +1680,7 @@ openAiRoutes.post("/images/edits", async (c) => {
       return c.json(openAiError("Too many images. Maximum is 16.", "invalid_image_count"), 400);
     }
 
-    const settingsBundle = await getSettings(c.env);
+    const settingsBundle = c.get("settings");
     const imageMethod = imageGenerationMethod(settingsBundle);
     const parsedResponseFormat = resolveImageResponseFormatByMethodOrError(
       form.get("response_format"),
@@ -1706,7 +1709,7 @@ openAiRoutes.post("/images/edits", async (c) => {
     const chosen = await selectBestToken(c.env.DB, requestedModel);
     if (!chosen) {
       if (stream) {
-        await recordImageLog({
+        c.executionCtx.waitUntil(recordImageLog({
           env: c.env,
           ip,
           model: requestedModel,
@@ -1714,7 +1717,7 @@ openAiRoutes.post("/images/edits", async (c) => {
           keyName,
           status: 503,
           error: "NO_AVAILABLE_TOKEN",
-        });
+        }));
         return new Response(
           createStreamErrorImageEventStream({
             message: "No available token",
@@ -1770,8 +1773,8 @@ openAiRoutes.post("/images/edits", async (c) => {
             cookie,
             settings: settingsBundle.grok,
             n,
-            onFinish: async ({ status, duration }) => {
-              await addRequestLog(c.env.DB, {
+            onFinish: ({ status, duration }) => {
+              c.executionCtx.waitUntil(addRequestLog(c.env.DB, {
                 ip,
                 model: requestedModel,
                 duration: Number(duration.toFixed(2)),
@@ -1779,14 +1782,13 @@ openAiRoutes.post("/images/edits", async (c) => {
                 key_name: keyName,
                 token_suffix: getTokenSuffix(chosen.token),
                 error: status === 200 ? "" : "stream_error",
-              });
+              }));
             },
           });
           return new Response(streamBody, { status: 200, headers: streamHeaders() });
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
-          await recordTokenFailure(c.env.DB, chosen.token, 500, msg.slice(0, 200));
-          await applyCooldown(c.env.DB, chosen.token, 500);
+          c.executionCtx.waitUntil(recordFailureAndCooldown(c.env.DB, chosen.token, 500, msg.slice(0, 200)));
           console.warn("Experimental image edit stream failed, fallback to legacy:", msg);
         }
       }
@@ -1800,18 +1802,21 @@ openAiRoutes.post("/images/edits", async (c) => {
       });
       if (!upstream.ok) {
         const txt = await upstream.text().catch(() => "");
-        await recordTokenFailure(c.env.DB, chosen.token, upstream.status, txt.slice(0, 200));
-        await applyCooldown(c.env.DB, chosen.token, upstream.status);
-        await recordImageLog({
-          env: c.env,
-          ip,
-          model: requestedModel,
-          start,
-          keyName,
-          status: upstream.status,
-          tokenSuffix: getTokenSuffix(chosen.token),
-          error: txt.slice(0, 200),
-        });
+        c.executionCtx.waitUntil(
+          Promise.all([
+            recordFailureAndCooldown(c.env.DB, chosen.token, upstream.status, txt.slice(0, 200)),
+            recordImageLog({
+              env: c.env,
+              ip,
+              model: requestedModel,
+              start,
+              keyName,
+              status: upstream.status,
+              tokenSuffix: getTokenSuffix(chosen.token),
+              error: txt.slice(0, 200),
+            }),
+          ]),
+        );
         return new Response(
           createStreamErrorImageEventStream({
             message: isContentModerationMessage(txt)
@@ -1830,8 +1835,8 @@ openAiRoutes.post("/images/edits", async (c) => {
         cookie,
         settings: settingsBundle.grok,
         n,
-        onFinish: async ({ status, duration }) => {
-          await addRequestLog(c.env.DB, {
+        onFinish: ({ status, duration }) => {
+          c.executionCtx.waitUntil(addRequestLog(c.env.DB, {
             ip,
             model: requestedModel,
             duration: Number(duration.toFixed(2)),
@@ -1839,7 +1844,7 @@ openAiRoutes.post("/images/edits", async (c) => {
             key_name: keyName,
             token_suffix: getTokenSuffix(chosen.token),
             error: status === 200 ? "" : "stream_error",
-          });
+          }));
         },
       });
       return new Response(streamBody, { status: 200, headers: streamHeaders() });
@@ -1862,7 +1867,7 @@ openAiRoutes.post("/images/edits", async (c) => {
         if (!urls.length) throw new Error("Experimental image edit returned no images");
         const selected = pickImageResults(urls, n);
 
-        await recordImageLog({
+        c.executionCtx.waitUntil(recordImageLog({
           env: c.env,
           ip,
           model: requestedModel,
@@ -1871,12 +1876,11 @@ openAiRoutes.post("/images/edits", async (c) => {
           status: 200,
           tokenSuffix: getTokenSuffix(chosen.token),
           error: "",
-        });
+        }));
         return c.json(buildImageJsonPayload(responseField, selected));
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        await recordTokenFailure(c.env.DB, chosen.token, 500, msg.slice(0, 200));
-        await applyCooldown(c.env.DB, chosen.token, 500);
+        c.executionCtx.waitUntil(recordFailureAndCooldown(c.env.DB, chosen.token, 500, msg.slice(0, 200)));
         console.warn("Experimental image edit failed, fallback to legacy:", msg);
       }
     }
@@ -1896,7 +1900,7 @@ openAiRoutes.post("/images/edits", async (c) => {
     const urls = dedupeImages(urlsNested.flat().filter(Boolean));
     const selected = pickImageResults(urls, n);
 
-    await recordImageLog({
+    c.executionCtx.waitUntil(recordImageLog({
       env: c.env,
       ip,
       model: requestedModel,
@@ -1905,13 +1909,13 @@ openAiRoutes.post("/images/edits", async (c) => {
       status: 200,
       tokenSuffix: getTokenSuffix(chosen.token),
       error: "",
-    });
+    }));
 
     return c.json(buildImageJsonPayload(responseField, selected));
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     if (isContentModerationMessage(message)) {
-      await recordImageLog({
+      c.executionCtx.waitUntil(recordImageLog({
         env: c.env,
         ip,
         model: requestedModel || "image",
@@ -1919,10 +1923,10 @@ openAiRoutes.post("/images/edits", async (c) => {
         keyName,
         status: 400,
         error: message,
-      });
+      }));
       return c.json(openAiError(message, "content_policy_violation"), 400);
     }
-    await recordImageLog({
+    c.executionCtx.waitUntil(recordImageLog({
       env: c.env,
       ip,
       model: requestedModel || "image",
@@ -1930,7 +1934,7 @@ openAiRoutes.post("/images/edits", async (c) => {
       keyName,
       status: 500,
       error: message,
-    });
+    }));
     return c.json(openAiError(message || "Internal error", "internal_error"), 500);
   }
 });

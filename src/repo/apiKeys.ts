@@ -191,3 +191,26 @@ export async function getApiKeyLimits(db: Env["DB"], key: string): Promise<ApiKe
   };
 }
 
+export async function validateApiKeyWithLimits(
+  db: Env["DB"],
+  key: string,
+): Promise<{ key: string; name: string; limits: ApiKeyLimits } | null> {
+  const row = await dbFirst<{ key: string; name: string; is_active: number; chat_limit: number; heavy_limit: number; image_limit: number; video_limit: number }>(
+    db,
+    "SELECT key, name, is_active, chat_limit, heavy_limit, image_limit, video_limit FROM api_keys WHERE key = ?",
+    [key],
+  );
+  if (!row) return null;
+  if (!row.is_active) return null;
+  return {
+    key: row.key,
+    name: row.name,
+    limits: {
+      chat_limit: Number(row.chat_limit ?? -1),
+      heavy_limit: Number(row.heavy_limit ?? -1),
+      image_limit: Number(row.image_limit ?? -1),
+      video_limit: Number(row.video_limit ?? -1),
+    },
+  };
+}
+

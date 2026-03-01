@@ -142,23 +142,22 @@ export async function selectBestToken(db: Env["DB"], model: string): Promise<{ t
   const now = nowMs();
   const field = "remaining_queries";
 
-  const pick = async (token_type: TokenType): Promise<{ token: string; token_type: TokenType } | null> => {
-    const row = await dbFirst<{ token: string }>(
-      db,
-      `SELECT token FROM tokens
-       WHERE token_type = ?
-         AND status != 'expired'
-         AND failed_count < ?
-         AND (cooldown_until IS NULL OR cooldown_until <= ?)
-         AND ${field} != 0
-       ORDER BY CASE WHEN ${field} = -1 THEN 0 ELSE 1 END, ${field} DESC, created_time ASC
-       LIMIT 1`,
-      [token_type, MAX_FAILURES, now],
-    );
-    return row ? { token: row.token, token_type } : null;
-  };
-
-  return (await pick("sso")) ?? (await pick("ssoSuper"));
+  const row = await dbFirst<{ token: string; token_type: TokenType }>(
+    db,
+    `SELECT token, token_type FROM tokens
+     WHERE status != 'expired'
+       AND failed_count < ?
+       AND (cooldown_until IS NULL OR cooldown_until <= ?)
+       AND ${field} != 0
+     ORDER BY
+       CASE WHEN token_type = 'sso' THEN 0 ELSE 1 END,
+       CASE WHEN ${field} = -1 THEN 0 ELSE 1 END,
+       ${field} DESC,
+       created_time ASC
+     LIMIT 1`,
+    [MAX_FAILURES, now],
+  );
+  return row ? { token: row.token, token_type: row.token_type } : null;
 }
 
 export async function recordTokenFailure(
@@ -191,10 +190,58 @@ export async function applyCooldown(db: Env["DB"], token: string, status: number
     const seconds = remaining > 0 || remaining === -1 ? 3600 : 36000;
     until = now + seconds * 1000;
   } else {
-    // Workers 不适合做“按请求次数”冷却，这里用短时间冷却近似替代。
+    // Workers 不适合做"按请求次数"冷却，这里用短时间冷却近似替代。
     until = now + 30 * 1000;
   }
   await dbRun(db, "UPDATE tokens SET cooldown_until = ? WHERE token = ?", [until, token]);
+}
+
+export async function recordFailureAndCooldown(
+  db: Env["DB"],
+  token: string,
+  status: number,
+  message: string,
+): Promise<void> {
+  const now = nowMs();
+  const reason = `${status}: ${message}`;
+
+  if (status === 429) {
+    // 429: need remaining_queries to compute cooldown duration, so batch(update + select) then batch(cooldown + expire)
+    const [, selectResult] = await db.batch([
+      db.prepare(
+        "UPDATE tokens SET failed_count = failed_count + 1, last_failure_time = ?, last_failure_reason = ? WHERE token = ?",
+      ).bind(now, reason, token),
+      db.prepare("SELECT failed_count, remaining_queries FROM tokens WHERE token = ?").bind(token),
+    ]);
+    const row = selectResult?.results?.[0] as { failed_count: number; remaining_queries: number } | undefined;
+    if (!row) return;
+
+    const remaining = row.remaining_queries ?? -1;
+    const seconds = remaining > 0 || remaining === -1 ? 3600 : 36000;
+    const until = now + seconds * 1000;
+
+    const stmts: D1PreparedStatement[] = [
+      db.prepare("UPDATE tokens SET cooldown_until = ? WHERE token = ?").bind(until, token),
+    ];
+    if (status >= 400 && status < 500 && row.failed_count >= MAX_FAILURES) {
+      stmts.push(db.prepare("UPDATE tokens SET status = 'expired' WHERE token = ?").bind(token));
+    }
+    await db.batch(stmts);
+  } else {
+    // Non-429: cooldown is fixed 30s, batch everything in one shot
+    const until = now + 30 * 1000;
+    const [, selectResult] = await db.batch([
+      db.prepare(
+        "UPDATE tokens SET failed_count = failed_count + 1, last_failure_time = ?, last_failure_reason = ?, cooldown_until = ? WHERE token = ?",
+      ).bind(now, reason, until, token),
+      db.prepare("SELECT failed_count FROM tokens WHERE token = ?").bind(token),
+    ]);
+    const row = selectResult?.results?.[0] as { failed_count: number } | undefined;
+    if (!row) return;
+    if (status >= 400 && status < 500 && row.failed_count >= MAX_FAILURES) {
+      await dbRun(db, "UPDATE tokens SET status = 'expired' WHERE token = ?", [token]);
+    }
+  }
 }
 
 export async function updateTokenLimits(

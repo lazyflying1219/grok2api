@@ -1,4 +1,4 @@
-import { dbFirst, dbRun } from "./db";
+import { dbAll } from "./db";
 import type { Env } from "./env";
 import { nowMs } from "./utils/time";
 
@@ -153,46 +153,30 @@ export function normalizeImageGenerationMethod(value: unknown): string {
   return IMAGE_METHOD_LEGACY;
 }
 
+const SETTINGS_KEYS = ["global", "grok", "token", "cache", "performance"] as const;
+
 export async function getSettings(env: Env): Promise<SettingsBundle> {
-  const globalRow = await dbFirst<{ value: string }>(
+  const rows = await dbAll<{ key: string; value: string }>(
     env.DB,
-    "SELECT value FROM settings WHERE key = ?",
-    ["global"],
+    `SELECT key, value FROM settings WHERE key IN (${SETTINGS_KEYS.map(() => "?").join(",")})`,
+    [...SETTINGS_KEYS],
   );
-  const grokRow = await dbFirst<{ value: string }>(
-    env.DB,
-    "SELECT value FROM settings WHERE key = ?",
-    ["grok"],
-  );
-  const tokenRow = await dbFirst<{ value: string }>(
-    env.DB,
-    "SELECT value FROM settings WHERE key = ?",
-    ["token"],
-  );
-  const cacheRow = await dbFirst<{ value: string }>(
-    env.DB,
-    "SELECT value FROM settings WHERE key = ?",
-    ["cache"],
-  );
-  const performanceRow = await dbFirst<{ value: string }>(
-    env.DB,
-    "SELECT value FROM settings WHERE key = ?",
-    ["performance"],
-  );
-  const globalCfg = globalRow?.value
-    ? safeParseJson<GlobalSettings>(globalRow.value, DEFAULTS.global)
+  const map = new Map(rows.map((r) => [r.key, r.value]));
+
+  const globalCfg = map.has("global")
+    ? safeParseJson<GlobalSettings>(map.get("global")!, DEFAULTS.global)
     : DEFAULTS.global;
-  const grokCfg = grokRow?.value
-    ? safeParseJson<GrokSettings>(grokRow.value, DEFAULTS.grok)
+  const grokCfg = map.has("grok")
+    ? safeParseJson<GrokSettings>(map.get("grok")!, DEFAULTS.grok)
     : DEFAULTS.grok;
-  const tokenCfg = tokenRow?.value
-    ? safeParseJson<TokenSettings>(tokenRow.value, DEFAULTS.token)
+  const tokenCfg = map.has("token")
+    ? safeParseJson<TokenSettings>(map.get("token")!, DEFAULTS.token)
     : DEFAULTS.token;
-  const cacheCfg = cacheRow?.value
-    ? safeParseJson<CacheSettings>(cacheRow.value, DEFAULTS.cache)
+  const cacheCfg = map.has("cache")
+    ? safeParseJson<CacheSettings>(map.get("cache")!, DEFAULTS.cache)
     : DEFAULTS.cache;
-  const performanceCfg = performanceRow?.value
-    ? safeParseJson<PerformanceSettings>(performanceRow.value, DEFAULTS.performance)
+  const performanceCfg = map.has("performance")
+    ? safeParseJson<PerformanceSettings>(map.get("performance")!, DEFAULTS.performance)
     : DEFAULTS.performance;
   const mergedGrok = {
     ...DEFAULTS.grok,
@@ -235,30 +219,15 @@ export async function saveSettings(
   const nextToken: TokenSettings = { ...current.token, ...(updates.token_config ?? {}) };
   const nextCache: CacheSettings = { ...current.cache, ...(updates.cache_config ?? {}) };
   const nextPerformance: PerformanceSettings = { ...current.performance, ...(updates.performance_config ?? {}) };
-  await dbRun(
-    env.DB,
-    "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-    ["global", JSON.stringify(nextGlobal), now],
-  );
-  await dbRun(
-    env.DB,
-    "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-    ["grok", JSON.stringify(nextGrok), now],
-  );
-  await dbRun(
-    env.DB,
-    "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-    ["token", JSON.stringify(nextToken), now],
-  );
-  await dbRun(
-    env.DB,
-    "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-    ["cache", JSON.stringify(nextCache), now],
-  );
-  await dbRun(
-    env.DB,
-    "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-    ["performance", JSON.stringify(nextPerformance), now],
-  );
+
+  const upsertSql =
+    "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at";
+  await env.DB.batch([
+    env.DB.prepare(upsertSql).bind("global", JSON.stringify(nextGlobal), now),
+    env.DB.prepare(upsertSql).bind("grok", JSON.stringify(nextGrok), now),
+    env.DB.prepare(upsertSql).bind("token", JSON.stringify(nextToken), now),
+    env.DB.prepare(upsertSql).bind("cache", JSON.stringify(nextCache), now),
+    env.DB.prepare(upsertSql).bind("performance", JSON.stringify(nextPerformance), now),
+  ]);
 }
 

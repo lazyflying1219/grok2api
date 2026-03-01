@@ -1,14 +1,17 @@
 import type { MiddlewareHandler } from "hono";
 import type { Env } from "./env";
+import type { SettingsBundle } from "./settings";
 import { getSettings } from "./settings";
 import { dbFirst } from "./db";
-import { validateApiKey } from "./repo/apiKeys";
+import { validateApiKeyWithLimits } from "./repo/apiKeys";
+import type { ApiKeyLimits } from "./repo/apiKeys";
 import { verifyAdminSession } from "./repo/adminSessions";
 
 export interface ApiAuthInfo {
   key: string | null;
   name: string;
   is_admin: boolean;
+  limits?: ApiKeyLimits;
 }
 
 function bearerToken(authHeader: string | null): string | null {
@@ -27,12 +30,13 @@ function authError(message: string, code: string): Record<string, unknown> {
   };
 }
 
-export const requireApiAuth: MiddlewareHandler<{ Bindings: Env; Variables: { apiAuth: ApiAuthInfo } }> = async (
+export const requireApiAuth: MiddlewareHandler<{ Bindings: Env; Variables: { apiAuth: ApiAuthInfo; settings: SettingsBundle } }> = async (
   c,
   next,
 ) => {
   const token = bearerToken(c.req.header("Authorization") ?? null);
   const settings = await getSettings(c.env);
+  c.set("settings", settings);
 
   if (!token) {
     const globalKey = (settings.grok.api_key ?? "").trim();
@@ -55,9 +59,9 @@ export const requireApiAuth: MiddlewareHandler<{ Bindings: Env; Variables: { api
     return next();
   }
 
-  const keyInfo = await validateApiKey(c.env.DB, token);
+  const keyInfo = await validateApiKeyWithLimits(c.env.DB, token);
   if (keyInfo) {
-    c.set("apiAuth", { key: keyInfo.key, name: keyInfo.name, is_admin: false });
+    c.set("apiAuth", { key: keyInfo.key, name: keyInfo.name, is_admin: false, limits: keyInfo.limits });
     return next();
   }
 
