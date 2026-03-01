@@ -1090,12 +1090,8 @@ function toggleBatchPause() {
   if (!isBatchProcessing) return;
   isBatchPaused = !isBatchPaused;
   updateBatchProgress();
-  if (!isBatchPaused) {
-    if (currentBatchAction === 'refresh') {
-      processBatchQueue();
-    } else if (currentBatchAction === 'delete') {
-      processDeleteQueue();
-    }
+  if (!isBatchPaused && currentBatchAction === 'refresh') {
+    processBatchQueue();
   }
 }
 
@@ -1173,13 +1169,23 @@ async function startBatchDelete() {
   isBatchProcessing = true;
   isBatchPaused = false;
   currentBatchAction = 'delete';
-  batchQueue = selected.map(t => normalizeSsoToken(t.token));
-  batchTotal = batchQueue.length;
+  batchTotal = selected.length;
   batchProcessed = 0;
 
   updateBatchProgress();
   setActionButtonsState();
-  processDeleteQueue();
+
+  const toRemove = new Set(selected.map(t => normalizeSsoToken(t.token)));
+  flatTokens = flatTokens.filter(t => !toRemove.has(normalizeSsoToken(t.token)));
+  applyFilters();
+
+  try {
+    await syncToServer();
+    batchProcessed = batchTotal;
+  } catch (e) {
+    showToast('删除失败', 'error');
+  }
+  finishBatchProcess();
 }
 
 let confirmResolver = null;
@@ -1231,29 +1237,6 @@ function closeConfirm(ok) {
   }, 200);
 }
 
-async function processDeleteQueue() {
-  if (!isBatchProcessing || isBatchPaused || currentBatchAction !== 'delete') return;
-  if (batchQueue.length === 0) {
-    finishBatchProcess();
-    return;
-  }
-  const chunk = batchQueue.splice(0, BATCH_SIZE);
-  const toRemove = new Set(chunk);
-  flatTokens = flatTokens.filter(t => !toRemove.has(normalizeSsoToken(t.token)));
-  applyFilters();
-  try {
-    await syncToServer();
-    batchProcessed += chunk.length;
-  } catch (e) {
-    showToast('删除失败', 'error');
-    batchProcessed += chunk.length;
-  }
-  updateBatchProgress();
-  if (!isBatchProcessing || isBatchPaused) return;
-  setTimeout(() => {
-    processDeleteQueue();
-  }, 400);
-}
 
 function escapeHtml(text) {
   if (!text) return '';
