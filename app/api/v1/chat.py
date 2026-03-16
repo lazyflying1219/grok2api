@@ -18,14 +18,18 @@ from app.services.quota import enforce_daily_quota
 router = APIRouter(tags=["Chat"])
 
 
-VALID_ROLES = ["developer", "system", "user", "assistant"]
+VALID_ROLES = ["developer", "system", "user", "assistant", "tool"]
 USER_CONTENT_TYPES = ["text", "image_url", "input_audio", "file"]
 
 
 class MessageItem(BaseModel):
     """消息项"""
     role: str
-    content: Union[str, List[Dict[str, Any]]]
+    # OpenAI 的 tool_calls 场景下 assistant.content 可能为 null；tool.content 也可能是对象。
+    content: Union[str, List[Dict[str, Any]], Dict[str, Any], None] = None
+
+    # 允许携带 tool_call_id / tool_calls / name 等字段，并在 model_dump 时保留。
+    model_config = {"extra": "allow"}
     
     @field_validator("role")
     @classmethod
@@ -100,6 +104,11 @@ class ChatCompletionRequest(BaseModel):
     messages: List[MessageItem] = Field(..., description="消息数组")
     stream: Optional[bool] = Field(False, description="是否流式输出")
     thinking: Optional[str] = Field(None, description="思考模式: enabled/disabled/None")
+
+    # OpenAI tools / tool_calls 相关参数
+    tools: Optional[List[Dict[str, Any]]] = Field(None, description="工具定义（OpenAI tools 规范）")
+    tool_choice: Optional[Any] = Field("auto", description="工具选择策略（auto/none/required/指定函数）")
+    parallel_tool_calls: Optional[bool] = Field(True, description="是否允许并行工具调用")
     
     # 视频生成配置
     video_config: Optional[VideoConfig] = Field(None, description="视频生成参数")
@@ -122,7 +131,8 @@ def validate_request(request: ChatCompletionRequest):
     # 验证消息
     for idx, msg in enumerate(request.messages):
         content = msg.content
-        
+        role = msg.role
+
         # 字符串内容
         if isinstance(content, str):
             if not content.strip():
@@ -201,6 +211,26 @@ def validate_request(request: ChatCompletionRequest):
                             code="missing_url"
                         )
 
+        # tool 结果允许对象内容（会在下游格式化为文本）
+        elif isinstance(content, dict):
+            if role != "tool":
+                raise ValidationException(
+                    message="Only 'tool' role supports object content",
+                    param=f"messages.{idx}.content",
+                    code="invalid_content"
+                )
+
+        # content 允许为 null（常见于 assistant.tool_calls）
+        elif content is None:
+            continue
+
+        else:
+            raise ValidationException(
+                message="Invalid message content type",
+                param=f"messages.{idx}.content",
+                code="invalid_content"
+            )
+
 
 @router.post("/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str] = Depends(verify_api_key)):
@@ -238,7 +268,10 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
             model=request.model,
             messages=[msg.model_dump() for msg in request.messages],
             stream=is_stream,
-            thinking=request.thinking
+            thinking=request.thinking,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            parallel_tool_calls=request.parallel_tool_calls,
         )
     
     if isinstance(result, dict):
