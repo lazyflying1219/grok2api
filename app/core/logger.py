@@ -94,12 +94,21 @@ def setup_logging(
     
     # 文件输出
     if file_logging:
-        logger.add(
-            _file_json_sink,
-            level=level,
-            format="{message}",
-            enqueue=True,
-        )
+        # enqueue=True 会启用多进程队列，在某些受限环境（例如沙箱/部分 CI）可能触发权限错误。
+        try:
+            logger.add(
+                _file_json_sink,
+                level=level,
+                format="{message}",
+                enqueue=True,
+            )
+        except (PermissionError, OSError):
+            logger.add(
+                _file_json_sink,
+                level=level,
+                format="{message}",
+                enqueue=False,
+            )
     
     return logger
 
