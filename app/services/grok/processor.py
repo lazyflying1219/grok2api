@@ -8,11 +8,12 @@ import random
 import html
 import orjson
 import tiktoken
-from typing import Any, AsyncGenerator, Optional, AsyncIterable, List
+from typing import Any, AsyncGenerator, Optional, AsyncIterable, List, Dict
 
 from app.core.config import get_config
 from app.core.logger import logger
 from app.services.grok.assets import DownloadService
+from app.services.grok.utils.tool_call import parse_tool_calls
 
 
 ASSET_URL = "https://assets.grok.com/"
@@ -146,7 +147,17 @@ class BaseProcessor:
 class StreamProcessor(BaseProcessor):
     """流式响应处理器"""
     
-    def __init__(self, model: str, token: str = "", think: bool = None, prompt_tokens: int = 0):
+    def __init__(
+        self,
+        model: str,
+        token: str = "",
+        think: bool = None,
+        prompt_tokens: int = 0,
+        *,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Any = "auto",
+        parallel_tool_calls: bool = True,
+    ):
         super().__init__(model, token)
         self.think_opened: bool = False
         self.role_sent: bool = False
@@ -156,6 +167,13 @@ class StreamProcessor(BaseProcessor):
         self._completion_tokens = 0
         self._raw_parts: list[str] = []
 
+        self.tools: List[Dict[str, Any]] = tools or []
+        self.tool_choice: Any = tool_choice if tool_choice is not None else "auto"
+        self.parallel_tool_calls: bool = (
+            parallel_tool_calls if parallel_tool_calls is not None else True
+        )
+        self.enable_tool_calls: bool = bool(self.tools and self.tool_choice != "none")
+
         if think is None:
             self.show_think = get_config("grok.thinking", False)
         else:
@@ -163,6 +181,9 @@ class StreamProcessor(BaseProcessor):
     
     async def process(self, response: AsyncIterable[bytes]) -> AsyncGenerator[str, None]:
         """处理流式响应"""
+        # tools 模式下先缓冲输出，避免客户端/SDK 误解析中间态 `<tool_call>`。
+        tool_buffer: list[str] | None = [] if self.enable_tool_calls else None
+
         def _emit(content: str) -> str:
             # 不要先发一个空 role chunk（会让首字耗时统计失真）。
             # 只在第一次真正输出内容时，顺带把 role 一起发出去。
@@ -230,10 +251,36 @@ class StreamProcessor(BaseProcessor):
                 if (token := resp.get("token")) is not None:
                     if token and not (self.filter_tags and any(t in token for t in self.filter_tags)):
                         self._raw_parts.append(token)
-                        yield _emit(token)
+                        if tool_buffer is not None:
+                            tool_buffer.append(token)
+                        else:
+                            yield _emit(token)
 
             if self.think_opened:
                 yield _emit("</think>\n")
+
+            # tool_calls：尝试从缓冲区解析 <tool_call> 块
+            if tool_buffer:
+                raw_content = "".join(tool_buffer).strip()
+                text_content, tool_calls = parse_tool_calls(raw_content, tools=self.tools)
+                if tool_calls:
+                    chunk = self._chunk_template.copy()
+                    chunk["choices"] = [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "tool_calls": tool_calls},
+                            "logprobs": None,
+                            "finish_reason": "tool_calls",
+                        }
+                    ]
+                    yield f"data: {orjson.dumps(chunk).decode()}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                # 未触发 tool_calls：回退为一次性输出（保持兼容性优先）
+                if text_content:
+                    yield _emit(text_content)
+
             yield self._sse(finish="stop")
             # Batch-count completion tokens once (much cheaper than per-token encoding)
             self._completion_tokens = await _count_tokens_async("".join(self._raw_parts))
@@ -265,10 +312,26 @@ class StreamProcessor(BaseProcessor):
 class CollectProcessor(BaseProcessor):
     """非流式响应处理器"""
     
-    def __init__(self, model: str, token: str = "", prompt_tokens: int = 0):
+    def __init__(
+        self,
+        model: str,
+        token: str = "",
+        prompt_tokens: int = 0,
+        *,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Any = "auto",
+        parallel_tool_calls: bool = True,
+    ):
         super().__init__(model, token)
         self.image_format = get_config("app.image_format", "url")
         self.prompt_tokens = prompt_tokens
+
+        self.tools: List[Dict[str, Any]] = tools or []
+        self.tool_choice: Any = tool_choice if tool_choice is not None else "auto"
+        self.parallel_tool_calls: bool = (
+            parallel_tool_calls if parallel_tool_calls is not None else True
+        )
+        self.enable_tool_calls: bool = bool(self.tools and self.tool_choice != "none")
 
     async def process(self, response: AsyncIterable[bytes]) -> dict[str, Any]:
         """处理并收集完整响应"""
@@ -321,6 +384,16 @@ class CollectProcessor(BaseProcessor):
         completion_tokens = await _count_tokens_async(content)
         total = self.prompt_tokens + completion_tokens
 
+        tool_calls: list[dict[str, Any]] = []
+        finish_reason = "stop"
+        final_content = content
+        if self.enable_tool_calls and content:
+            text_content, parsed = parse_tool_calls(content, tools=self.tools)
+            if parsed:
+                tool_calls = parsed
+                final_content = text_content
+                finish_reason = "tool_calls"
+
         return {
             "id": self.response_id,
             "object": "chat.completion",
@@ -329,8 +402,14 @@ class CollectProcessor(BaseProcessor):
             "system_fingerprint": fingerprint,
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": content, "refusal": None, "annotations": []},
-                "finish_reason": "stop"
+                "message": {
+                    "role": "assistant",
+                    "content": final_content,
+                    "refusal": None,
+                    "annotations": [],
+                    **({"tool_calls": tool_calls} if tool_calls else {}),
+                },
+                "finish_reason": finish_reason
             }],
             "usage": {
                 "prompt_tokens": self.prompt_tokens,

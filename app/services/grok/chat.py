@@ -23,6 +23,11 @@ from app.services.grok.model import ModelService
 from app.services.grok.assets import UploadService
 from app.services.grok.processor import StreamProcessor, CollectProcessor
 from app.services.grok.retry import RetryConfig
+from app.services.grok.utils.tool_call import (
+    build_tool_overrides,
+    build_tool_prompt,
+    format_tool_history,
+)
 from app.services.token import get_token_manager
 from app.services.request_stats import request_stats
 
@@ -159,6 +164,9 @@ class ChatRequest:
     messages: List[Dict[str, Any]]
     stream: bool = None
     think: bool = None
+    tools: List[Dict[str, Any]] | None = None
+    tool_choice: Any = "auto"
+    parallel_tool_calls: bool = True
 
 
 class MessageExtractor:
@@ -170,20 +178,37 @@ class MessageExtractor:
     VIDEO_UNSUPPORTED = {"input_audio", "file"}
     
     @staticmethod
-    def extract(messages: List[Dict[str, Any]], is_video: bool = False) -> tuple[str, List[str]]:
+    def extract(
+        messages: List[Dict[str, Any]],
+        is_video: bool = False,
+        *,
+        tools: List[Dict[str, Any]] | None = None,
+        tool_choice: Any = "auto",
+        parallel_tool_calls: bool = True,
+    ) -> tuple[str, List[str]]:
         """
         从 OpenAI 消息格式提取内容
         
         Args:
             messages: OpenAI 格式消息列表
             is_video: 是否为视频模型
-            
+            tools: OpenAI tools
+            tool_choice: OpenAI tool_choice
+            parallel_tool_calls: 是否允许并行工具调用
+             
         Returns:
             (text, attachments): 拼接后的文本和需要上传的附件列表
             
         Raises:
             ValueError: 视频模型遇到不支持的内容类型
         """
+        tools = tools or []
+        # tool_choice 可能是 dict（强制某个函数），这里保持原样交给 build_tool_prompt/overrides 处理
+        if tool_choice is None:
+            tool_choice = "auto"
+        if parallel_tool_calls is None:
+            parallel_tool_calls = True
+
         texts = []
         attachments = []  # 需要上传的附件 (URL 或 base64)
 
@@ -241,6 +266,13 @@ class MessageExtractor:
 
             if parts:
                 extracted.append({"role": role, "text": "\n".join(parts)})
+
+        # tools: prompt 模式下注入系统提示；passthrough 模式仅在 payload 里走 toolOverrides
+        if not is_video and tools and tool_choice != "none":
+            tool_call_mode = get_config("app.tool_call_mode", "prompt")
+            if tool_call_mode == "prompt":
+                tool_prompt = build_tool_prompt(tools, tool_choice, parallel_tool_calls)
+                extracted.insert(0, {"role": "system", "text": tool_prompt})
 
         # 合并文本
         last_user_index = None
@@ -312,7 +344,11 @@ class ChatRequestBuilder:
         mode: str,
         think: bool = None,
         file_attachments: List[str] = None,
-        image_attachments: List[str] = None
+        image_attachments: List[str] = None,
+        *,
+        tools: List[Dict[str, Any]] | None = None,
+        tool_choice: Any = "auto",
+        parallel_tool_calls: bool = True,
     ) -> Dict[str, Any]:
         """
         构造请求体
@@ -346,6 +382,18 @@ class ChatRequestBuilder:
             "modelConfigOverride": {"modelMap": {}},
             "requestModelDetails": {"modelId": model}
         }
+
+        # tool calling（按配置选择 prompt 注入 or 上游 passthrough）
+        tools = tools or []
+        if tool_choice is None:
+            tool_choice = "auto"
+        if parallel_tool_calls is None:
+            parallel_tool_calls = True
+        tool_call_mode = get_config("app.tool_call_mode", "prompt")
+        if tools and tool_choice != "none" and tool_call_mode == "passthrough":
+            payload["toolOverrides"] = build_tool_overrides(tools, tool_choice, parallel_tool_calls)
+        else:
+            payload["toolOverrides"] = {}
         return payload
 
 
@@ -366,7 +414,11 @@ class GrokChatService:
         think: bool = None,
         stream: bool = None,
         file_attachments: List[str] = None,
-        image_attachments: List[str] = None
+        image_attachments: List[str] = None,
+        *,
+        tools: List[Dict[str, Any]] | None = None,
+        tool_choice: Any = "auto",
+        parallel_tool_calls: bool = True,
     ):
         """
         发送聊天请求
@@ -390,7 +442,10 @@ class GrokChatService:
         headers = ChatRequestBuilder.build_headers(token)
         payload = ChatRequestBuilder.build_payload(
             message, model, mode, think, 
-            file_attachments, image_attachments
+            file_attachments, image_attachments,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
         )
         proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
         timeout = get_config("grok.timeout", TIMEOUT)
@@ -454,10 +509,23 @@ class GrokChatService:
         grok_model = model_info.grok_model
         mode = model_info.model_mode
         is_video = model_info.is_video
+
+        tools = request.tools or []
+        tool_choice = request.tool_choice if request.tool_choice is not None else "auto"
+        parallel_tool_calls = request.parallel_tool_calls if request.parallel_tool_calls is not None else True
+
+        # 把 tool 角色与 assistant.tool_calls 转成可喂给上游的文本历史
+        messages = format_tool_history(request.messages)
         
         # 提取消息和附件
         try:
-            message, attachments = MessageExtractor.extract(request.messages, is_video=is_video)
+            message, attachments = MessageExtractor.extract(
+                messages,
+                is_video=is_video,
+                tools=tools,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+            )
         except ValueError as e:
             raise ValidationException(str(e))
         
@@ -489,7 +557,10 @@ class GrokChatService:
         response = await self.chat(
             token, message, grok_model, mode, think, stream,
             file_attachments=file_ids,
-            image_attachments=image_ids
+            image_attachments=image_ids,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
         )
         
         return response, stream, request.model
@@ -505,7 +576,10 @@ class ChatService:
         model: str,
         messages: List[Dict[str, Any]],
         stream: bool = None,
-        thinking: str = None
+        thinking: str = None,
+        tools: List[Dict[str, Any]] | None = None,
+        tool_choice: Any = "auto",
+        parallel_tool_calls: bool = True,
     ):
         """
         Chat Completions 入口
@@ -528,11 +602,20 @@ class ChatService:
 
         is_stream = stream if stream is not None else get_config("grok.stream", True)
 
+        tools = tools or []
+        if tool_choice is None:
+            tool_choice = "auto"
+        if parallel_tool_calls is None:
+            parallel_tool_calls = True
+
         chat_request = ChatRequest(
             model=model,
             messages=messages,
             stream=is_stream,
-            think=think
+            think=think,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
         )
 
         # 获取 token 并请求 Grok（失败时自动换 token 重试）
@@ -620,7 +703,15 @@ class ChatService:
         prompt_tokens = await prompt_tokens_task
 
         if is_stream:
-            processor = StreamProcessor(model_name, token, think, prompt_tokens=prompt_tokens).process(response)
+            processor = StreamProcessor(
+                model_name,
+                token,
+                think,
+                prompt_tokens=prompt_tokens,
+                tools=tools,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+            ).process(response)
 
             async def _wrapped_stream():
                 completed = False
@@ -647,7 +738,14 @@ class ChatService:
             return _wrapped_stream()
 
         try:
-            result = await CollectProcessor(model_name, token, prompt_tokens=prompt_tokens).process(response)
+            result = await CollectProcessor(
+                model_name,
+                token,
+                prompt_tokens=prompt_tokens,
+                tools=tools,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+            ).process(response)
             try:
                 await token_mgr.sync_usage(token, model_name, consume_on_fail=True, is_usage=True)
                 await request_stats.record_request(model_name, success=True)
