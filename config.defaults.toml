@@ -20,6 +20,8 @@ app_key = "admin"
 api_key = ""
 image_format = "url"
 video_format = "url"
+# tools/tool_calls 支持模式：prompt（注入系统提示）或 passthrough（走上游 toolOverrides）
+tool_call_mode = "prompt"
 
 [token]
 auto_refresh = true
